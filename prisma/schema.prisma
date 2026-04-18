@@ -1,0 +1,105 @@
+datasource db {
+  provider = "sqlite"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Deck {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  createdAt   DateTime @default(now())
+  cards       Card[]
+}
+
+model Card {
+  id         String    @id @default(cuid())
+  deckId     String
+  deck       Deck      @relation(fields: [deckId], references: [id], onDelete: Cascade)
+  front      String
+  back       String
+  tags       String    @default("")
+  type       String    @default("guided")
+  maturity   String    @default("new")
+  source     String?
+  // FSRS scheduling
+  due        DateTime  @default(now())
+  stability  Float     @default(0)
+  difficulty Float     @default(0)
+  reps       Int       @default(0)
+  lapses     Int       @default(0)
+  state      Int       @default(0)
+  lastReview DateTime?
+  interval   Float     @default(0)
+  // RAG
+  embedding  String?
+  // Metadata
+  suspended  Boolean   @default(false)
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  reviews    Review[]
+
+  @@index([deckId])
+  @@index([due])
+  @@index([state])
+}
+
+model Review {
+  id          String   @id @default(cuid())
+  cardId      String
+  card        Card     @relation(fields: [cardId], references: [id], onDelete: Cascade)
+  rating      Int
+  responseMs  Int?
+  stability   Float
+  difficulty  Float
+  elapsedDays Float
+  reviewedAt  DateTime @default(now())
+
+  @@index([cardId])
+  @@index([reviewedAt])
+}
+
+model StudySession {
+  id             String    @id @default(cuid())
+  startTime      DateTime  @default(now())
+  endTime        DateTime?
+  cardsReviewed  Int       @default(0)
+  newCards       Int       @default(0)
+  accuracy       Float     @default(0)
+  topicBreakdown String    @default("{}")
+
+  @@index([startTime])
+}
+
+model Topic {
+  id            String         @id @default(cuid())
+  name          String         @unique
+  priority      Int            @default(5)
+  maturityLevel String         @default("beginner")
+  deckName      String?
+  goals         LearningGoal[]
+  createdAt     DateTime       @default(now())
+}
+
+model LearningGoal {
+  id          String   @id @default(cuid())
+  topicId     String
+  topic       Topic    @relation(fields: [topicId], references: [id], onDelete: Cascade)
+  description String
+  type        String   @default("guided")
+  status      String   @default("active")
+  createdAt   DateTime @default(now())
+
+  @@index([topicId])
+}
+
+model Config {
+  id                       String  @id @default("default")
+  maxNewCardsPerSession    Int     @default(5)
+  maxReviewCardsPerSession Int     @default(15)
+  sessionDurationMinutes   Int     @default(15)
+  requestRetention         Float   @default(0.9)
+  practiceFirstMode        Boolean @default(true)
+}

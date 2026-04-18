@@ -1,0 +1,45 @@
+{
+  "name": "master-dev",
+  "version": "0.1.0",
+  "description": "Self-improving spaced repetition learning system for software engineering mastery",
+  "type": "module",
+  "bin": {
+    "master": "./build/cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "lint": "eslint src/",
+    "lint:fix": "eslint src/ --fix",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:push": "prisma db push",
+    "db:generate": "prisma generate",
+    "dev:cli": "tsx src/cli/index.ts",
+    "dev:mcp": "tsx src/mcp/server.ts"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.0.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@prisma/adapter-better-sqlite3": "^7.6.0",
+    "@prisma/client": "^7.6.0",
+    "adm-zip": "^0.5.16",
+    "better-sqlite3": "^12.8.0",
+    "commander": "^12.0.0",
+    "fzstd": "^0.1.1",
+    "ts-fsrs": "^4.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.8",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.58.0",
+    "@typescript-eslint/parser": "^8.58.0",
+    "eslint": "^10.1.0",
+    "prisma": "^7.6.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
