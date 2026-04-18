@@ -36,7 +36,7 @@ const prisma = createClient();
 setDb(prisma);
 
 const server = new Server(
-  { name: "master-dev-srs", version: "0.1.0" },
+  { name: "flashcard-mcp", version: "0.1.0" },
   { capabilities: { tools: {} } }
 );
 
