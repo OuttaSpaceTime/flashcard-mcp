@@ -20,6 +20,8 @@ import {
   searchCards,
   suspendCard,
   unsuspendCard,
+  listCards,
+  deleteCards,
 } from "../../src/core/card-service.js";
 import {
   startSession,
@@ -191,6 +193,38 @@ describe("MCP server tools (integration)", () => {
 
       const results = await searchCards("", { tags: ["hooks"] });
       expect(results.length).toBe(1);
+    });
+  });
+
+  // --- list_cards ---
+  describe("list_cards", () => {
+    it("filters untagged cards with tagFilter='empty'", async () => {
+      await createCard({ deckId, front: "Tagged", back: "A", tags: ["react"] });
+      await createCard({ deckId, front: "Untagged", back: "A" });
+
+      const results = await listCards({ tagFilter: "empty" });
+      expect(results.length).toBe(1);
+      expect(results[0].front).toBe("Untagged");
+    });
+
+    it("paginates and scopes by deckId", async () => {
+      for (let i = 0; i < 3; i++) {
+        await createCard({ deckId, front: `Q${i}`, back: `A${i}` });
+      }
+      const page = await listCards({ deckId, limit: 2 });
+      expect(page.length).toBe(2);
+    });
+  });
+
+  // --- delete_cards ---
+  describe("delete_cards", () => {
+    it("bulk deletes by id list", async () => {
+      const a = await createCard({ deckId, front: "Q1", back: "A1" });
+      const b = await createCard({ deckId, front: "Q2", back: "A2" });
+
+      const res = await deleteCards([a.card.id, b.card.id]);
+      expect(res.deleted).toBe(2);
+      expect(await getCard(a.card.id)).toBeNull();
     });
   });
 

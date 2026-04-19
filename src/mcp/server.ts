@@ -13,12 +13,15 @@ import {
   getCard,
   updateCard,
   deleteCard,
+  deleteCards,
   searchCards,
+  listCards,
   suspendCard,
   unsuspendCard,
   getDueCards,
   findSimilar,
 } from "../core/card-service.js";
+import { parseTags } from "../core/types.js";
 import {
   startSession,
   getNextCard,
@@ -212,6 +215,35 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           cardId: { type: "string" },
         },
         required: ["cardId"],
+      },
+    },
+    {
+      name: "list_cards",
+      description:
+        "List cards with optional deck/tag filters and pagination. tagFilter accepts 'empty' (untagged), 'has_any' (any tag), or an exact tag string. Returns id, truncated front/back, tags array, maturity, lapses, deckId. Default limit 50 (max 200).",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          deckId: { type: "string" },
+          tagFilter: {
+            type: "string",
+            description: "'empty' | 'has_any' | exact tag string",
+          },
+          limit: { type: "number" },
+          offset: { type: "number" },
+        },
+      },
+    },
+    {
+      name: "delete_cards",
+      description:
+        "Permanently delete multiple cards by ID. Returns count of cards deleted. Irreversible.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          cardIds: { type: "array", items: { type: "string" } },
+        },
+        required: ["cardIds"],
       },
     },
     {
@@ -503,6 +535,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const card = await suspendCard(reqArg(args, "cardId"));
         return {
           content: [{ type: "text", text: JSON.stringify({ suspended: card.suspended }) }],
+        };
+      }
+
+      case "list_cards": {
+        const cards = await listCards({
+          deckId: arg(args, "deckId"),
+          tagFilter: arg(args, "tagFilter"),
+          limit: arg<number>(args, "limit"),
+          offset: arg<number>(args, "offset"),
+        });
+        const trunc = (s: string): string =>
+          s.length > 120 ? s.slice(0, 120) + "…" : s;
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                count: cards.length,
+                cards: cards.map((c) => ({
+                  id: c.id,
+                  deckId: c.deckId,
+                  front: trunc(c.front),
+                  back: trunc(c.back),
+                  tags: parseTags(c.tags),
+                  maturity: c.maturity,
+                  lapses: c.lapses,
+                })),
+              }),
+            },
+          ],
+        };
+      }
+
+      case "delete_cards": {
+        const res = await deleteCards(reqArg<string[]>(args, "cardIds"));
+        return {
+          content: [{ type: "text", text: JSON.stringify(res) }],
         };
       }
 

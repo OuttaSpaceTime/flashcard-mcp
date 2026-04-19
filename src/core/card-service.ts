@@ -8,7 +8,7 @@ import {
   type CardForSimilarity,
   type SemanticOptions,
 } from "./embeddings.js";
-import { serializeTags } from "./types.js";
+import { parseTags, serializeTags } from "./types.js";
 import type { CardMaturity, CardType, DuplicateCheckResult } from "./types.js";
 import type { Card as PrismaCard } from "@prisma/client";
 
@@ -170,6 +170,55 @@ export async function unsuspendCard(id: string): Promise<PrismaCard> {
 export async function deleteCard(id: string): Promise<void> {
   const db = getDb();
   await db.card.delete({ where: { id } });
+}
+
+export async function deleteCards(ids: string[]): Promise<{ deleted: number }> {
+  if (ids.length === 0) return { deleted: 0 };
+  const db = getDb();
+  const res = await db.card.deleteMany({ where: { id: { in: ids } } });
+  return { deleted: res.count };
+}
+
+export async function listCards(filters: {
+  deckId?: string;
+  tagFilter?: "empty" | "has_any" | string;
+  limit?: number;
+  offset?: number;
+}): Promise<PrismaCard[]> {
+  const db = getDb();
+  const limit = Math.max(1, Math.min(filters.limit ?? 50, 200));
+  const offset = Math.max(0, filters.offset ?? 0);
+
+  const where: Record<string, unknown> = {};
+  if (filters.deckId != null && filters.deckId !== "") {
+    where.deckId = filters.deckId;
+  }
+
+  const tf = filters.tagFilter;
+  const isExactTag = tf != null && tf !== "" && tf !== "empty" && tf !== "has_any";
+
+  if (tf === "empty") where.tags = "";
+  else if (tf === "has_any") where.tags = { not: "" };
+  else if (isExactTag) where.tags = { contains: tf };
+
+  if (isExactTag) {
+    // `contains` can false-positive ("foo" inside "foobar"), so post-filter in JS.
+    // Over-fetch a bounded pool rather than loading every substring match.
+    const candidates = await db.card.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      take: (offset + limit) * 4,
+    });
+    const matched = candidates.filter((c) => parseTags(c.tags).includes(tf));
+    return matched.slice(offset, offset + limit);
+  }
+
+  return db.card.findMany({
+    where,
+    orderBy: { createdAt: "desc" },
+    skip: offset,
+    take: limit,
+  });
 }
 
 export async function searchCards(
