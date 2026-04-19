@@ -4,9 +4,11 @@ import {
   getCard,
   updateCard,
   deleteCard,
+  deleteCards,
   suspendCard,
   unsuspendCard,
   searchCards,
+  listCards,
 } from "../../src/core/card-service.js";
 import { createDeck } from "../../src/core/deck-service.js";
 import { getDb } from "../../src/db/client.js";
@@ -251,6 +253,118 @@ describe("card-service", () => {
       const results = await searchCards("", { tags: ["hooks"] });
       expect(results.length).toBe(1);
       expect(results[0].front).toBe("Q1");
+    });
+  });
+
+  describe("listCards", () => {
+    it("returns all cards when no filters are given", async () => {
+      await createCard({ deckId: testDeckId, front: "Q1", back: "A1" });
+      await createCard({ deckId: testDeckId, front: "Q2", back: "A2" });
+
+      const results = await listCards({});
+      expect(results.length).toBe(2);
+    });
+
+    it("tagFilter='empty' returns only untagged cards", async () => {
+      await createCard({ deckId: testDeckId, front: "Untagged", back: "A" });
+      await createCard({
+        deckId: testDeckId,
+        front: "Tagged",
+        back: "A",
+        tags: ["react"],
+      });
+
+      const results = await listCards({ tagFilter: "empty" });
+      expect(results.length).toBe(1);
+      expect(results[0].front).toBe("Untagged");
+    });
+
+    it("tagFilter='has_any' returns only tagged cards", async () => {
+      await createCard({ deckId: testDeckId, front: "Untagged", back: "A" });
+      await createCard({
+        deckId: testDeckId,
+        front: "Tagged",
+        back: "A",
+        tags: ["react"],
+      });
+
+      const results = await listCards({ tagFilter: "has_any" });
+      expect(results.length).toBe(1);
+      expect(results[0].front).toBe("Tagged");
+    });
+
+    it("exact tag match guards against substring collisions", async () => {
+      await createCard({
+        deckId: testDeckId,
+        front: "Foo card",
+        back: "A",
+        tags: ["foo"],
+      });
+      await createCard({
+        deckId: testDeckId,
+        front: "Foobar card",
+        back: "A",
+        tags: ["foobar"],
+      });
+
+      const results = await listCards({ tagFilter: "foo" });
+      expect(results.length).toBe(1);
+      expect(results[0].front).toBe("Foo card");
+    });
+
+    it("paginates with limit and offset", async () => {
+      for (let i = 0; i < 5; i++) {
+        await createCard({ deckId: testDeckId, front: `Q${i}`, back: `A${i}` });
+      }
+
+      const page1 = await listCards({ limit: 2, offset: 0 });
+      const page2 = await listCards({ limit: 2, offset: 2 });
+
+      expect(page1.length).toBe(2);
+      expect(page2.length).toBe(2);
+      expect(page1[0].id).not.toBe(page2[0].id);
+    });
+
+    it("scopes by deckId", async () => {
+      const db = getDb();
+      const deck2 = await db.deck.create({ data: { name: "Other" } });
+
+      await createCard({ deckId: testDeckId, front: "InDeck1", back: "A" });
+      await createCard({ deckId: deck2.id, front: "InDeck2", back: "A" });
+
+      const results = await listCards({ deckId: testDeckId });
+      expect(results.length).toBe(1);
+      expect(results[0].front).toBe("InDeck1");
+    });
+  });
+
+  describe("deleteCards", () => {
+    it("deletes multiple cards and returns count", async () => {
+      const a = await createCard({ deckId: testDeckId, front: "Q1", back: "A1" });
+      const b = await createCard({ deckId: testDeckId, front: "Q2", back: "A2" });
+      const c = await createCard({ deckId: testDeckId, front: "Q3", back: "A3" });
+
+      const res = await deleteCards([a.card.id, b.card.id]);
+      expect(res.deleted).toBe(2);
+
+      expect(await getCard(a.card.id)).toBeNull();
+      expect(await getCard(b.card.id)).toBeNull();
+      expect(await getCard(c.card.id)).not.toBeNull();
+    });
+
+    it("returns {deleted: 0} for empty array", async () => {
+      const res = await deleteCards([]);
+      expect(res.deleted).toBe(0);
+    });
+
+    it("silently ignores nonexistent ids mixed with real ones", async () => {
+      const { card } = await createCard({
+        deckId: testDeckId,
+        front: "Q",
+        back: "A",
+      });
+      const res = await deleteCards([card.id, "nonexistent-id"]);
+      expect(res.deleted).toBe(1);
     });
   });
 });
