@@ -5,4 +5,4 @@ prisma/*.db-journal
 .dumps/
 *.tsbuildinfo
 .env
-.claude/settings.local.json
+.claude/
