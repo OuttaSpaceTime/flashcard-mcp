@@ -338,6 +338,74 @@ describe("card-service", () => {
     });
   });
 
+  describe("category", () => {
+    it("defaults category to null when unspecified", async () => {
+      const { card } = await createCard({
+        deckId: testDeckId,
+        front: "Q",
+        back: "A",
+      });
+      expect(card.category).toBeNull();
+    });
+
+    it("creates a card with a category", async () => {
+      const { card } = await createCard({
+        deckId: testDeckId,
+        front: "Q",
+        back: "A",
+        category: "work",
+      });
+      expect(card.category).toBe("work");
+    });
+
+    it("updates a card's category and allows clearing it", async () => {
+      const { card } = await createCard({
+        deckId: testDeckId,
+        front: "Q",
+        back: "A",
+        category: "work",
+      });
+
+      const set = await updateCard(card.id, { category: "personal" });
+      expect(set.category).toBe("personal");
+
+      const cleared = await updateCard(card.id, { category: null });
+      expect(cleared.category).toBeNull();
+    });
+
+    it("listCards filters by exact category", async () => {
+      await createCard({ deckId: testDeckId, front: "W", back: "A", category: "work" });
+      await createCard({ deckId: testDeckId, front: "P", back: "A", category: "personal" });
+      await createCard({ deckId: testDeckId, front: "N", back: "A" });
+
+      const work = await listCards({ category: "work" });
+      expect(work.length).toBe(1);
+      expect(work[0].front).toBe("W");
+    });
+
+    it("listCards filters uncategorized and any-category", async () => {
+      await createCard({ deckId: testDeckId, front: "W", back: "A", category: "work" });
+      await createCard({ deckId: testDeckId, front: "N", back: "A" });
+
+      const uncategorized = await listCards({ category: "__uncategorized__" });
+      expect(uncategorized.length).toBe(1);
+      expect(uncategorized[0].front).toBe("N");
+
+      const any = await listCards({ category: "__any__" });
+      expect(any.length).toBe(1);
+      expect(any[0].front).toBe("W");
+    });
+
+    it("searchCards filters by category", async () => {
+      await createCard({ deckId: testDeckId, front: "closure work", back: "A", category: "work" });
+      await createCard({ deckId: testDeckId, front: "closure home", back: "A", category: "personal" });
+
+      const results = await searchCards("closure", { category: "work" });
+      expect(results.length).toBe(1);
+      expect(results[0].front).toBe("closure work");
+    });
+  });
+
   describe("deleteCards", () => {
     it("deletes multiple cards and returns count", async () => {
       const a = await createCard({ deckId: testDeckId, front: "Q1", back: "A1" });

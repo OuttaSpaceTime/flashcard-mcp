@@ -18,6 +18,7 @@ interface CreateCardInput {
   back: string;
   tags?: string[];
   type?: CardType;
+  category?: string | null;
   source?: string;
   checkDuplicates?: boolean;
 }
@@ -29,6 +30,12 @@ interface CreateCardResult {
 
 function cardEmbeddingText(front: string, back: string): string {
   return `${front} ${back}`;
+}
+
+function applyCategoryFilter(where: Record<string, unknown>, cat: string | undefined): void {
+  if (cat === "__uncategorized__") where.category = null;
+  else if (cat === "__any__") where.category = { not: null };
+  else if (cat != null && cat !== "") where.category = cat;
 }
 
 function scheduleEmbeddingUpdate(cardId: string, front: string, back: string): void {
@@ -86,6 +93,7 @@ export async function createCard(input: CreateCardInput): Promise<CreateCardResu
       back: input.back,
       tags: serializeTags(input.tags),
       type: input.type ?? "guided",
+      category: input.category ?? null,
       source: input.source ?? null,
       due: fsrsDefaults.due,
       stability: fsrsDefaults.stability,
@@ -144,6 +152,7 @@ export async function updateCard(
     front?: string;
     back?: string;
     tags?: string;
+    category?: string | null;
     source?: string;
   }
 ): Promise<PrismaCard> {
@@ -182,6 +191,7 @@ export async function deleteCards(ids: string[]): Promise<{ deleted: number }> {
 export async function listCards(filters: {
   deckId?: string;
   tagFilter?: "empty" | "has_any" | string;
+  category?: string;
   limit?: number;
   offset?: number;
 }): Promise<PrismaCard[]> {
@@ -193,6 +203,8 @@ export async function listCards(filters: {
   if (filters.deckId != null && filters.deckId !== "") {
     where.deckId = filters.deckId;
   }
+
+  applyCategoryFilter(where, filters.category);
 
   const tf = filters.tagFilter;
   const isExactTag = tf != null && tf !== "" && tf !== "empty" && tf !== "has_any";
@@ -226,6 +238,7 @@ export async function searchCards(
   filters?: {
     deckId?: string;
     tags?: string[];
+    category?: string;
     state?: number;
     maturity?: CardMaturity;
   }
@@ -258,6 +271,8 @@ export async function searchCards(
   if (filters?.maturity != null) {
     where.maturity = filters.maturity;
   }
+
+  applyCategoryFilter(where, filters?.category);
 
   return db.card.findMany({ where, orderBy: { createdAt: "desc" }, take: 100 });
 }

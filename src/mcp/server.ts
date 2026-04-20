@@ -57,6 +57,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           maxNewCards: { type: "number", description: "Max new cards (default 5)" },
           maxReviewCards: { type: "number", description: "Max review cards (default 15)" },
           practiceFirst: { type: "boolean", description: "Prioritize unguided/exercise cards" },
+          category: {
+            type: "string",
+            description: "Only include cards with this category (e.g. 'work', 'personal'). Omit for all cards.",
+          },
         },
       },
     },
@@ -107,6 +111,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           sessionId: { type: "string" },
           maxCards: { type: "number" },
           focusDeck: { type: "string" },
+          focusCategory: { type: "string", description: "Narrow queue to this category" },
         },
         required: ["sessionId"],
       },
@@ -155,6 +160,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           back: { type: "string" },
           tags: { type: "array", items: { type: "string" } },
           type: { type: "string", enum: ["guided", "unguided"] },
+          category: { type: "string", description: "Card category, e.g. 'work' or 'personal'" },
         },
         required: ["deckId", "front", "back"],
       },
@@ -180,6 +186,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           front: { type: "string" },
           back: { type: "string" },
           tags: { type: "string", description: "Comma-separated tags" },
+          category: {
+            type: ["string", "null"],
+            description: "Set card category; pass null to clear",
+          },
         },
         required: ["cardId"],
       },
@@ -229,6 +239,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             description: "'empty' | 'has_any' | exact tag string",
           },
+          category: {
+            type: "string",
+            description:
+              "Exact category name, or '__uncategorized__' for null, or '__any__' for any category.",
+          },
           limit: { type: "number" },
           offset: { type: "number" },
         },
@@ -255,6 +270,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           query: { type: "string" },
           deckId: { type: "string" },
           tags: { type: "array", items: { type: "string" } },
+          category: { type: "string" },
         },
         required: ["query"],
       },
@@ -319,6 +335,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           maxNewCardsPerSession: arg<number>(args, "maxNewCards"),
           maxReviewCardsPerSession: arg<number>(args, "maxReviewCards"),
           practiceFirstMode: arg<boolean>(args, "practiceFirst"),
+          category: arg<string>(args, "category"),
         });
         return {
           content: [
@@ -348,6 +365,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     type: card.type,
                     maturity: card.maturity,
                     tags: card.tags,
+                    category: card.category,
                     reps: card.reps,
                     lapses: card.lapses,
                   })
@@ -382,6 +400,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const adjusted = await adjustSession(reqArg(args, "sessionId"), {
           maxCards: arg<number>(args, "maxCards"),
           focusDeck: arg(args, "focusDeck"),
+          focusCategory: arg(args, "focusCategory"),
         });
         return {
           content: [
@@ -442,6 +461,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           back: reqArg(args, "back"),
           tags: arg<string[]>(args, "tags"),
           type: arg(args, "type") as "guided" | "unguided" | undefined,
+          category: arg<string>(args, "category"),
           checkDuplicates: true,
         });
         return {
@@ -479,6 +499,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 front: card.front,
                 back: card.back,
                 tags: card.tags,
+                category: card.category,
                 type: card.type,
                 maturity: card.maturity,
                 state: card.state,
@@ -494,13 +515,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "update_card": {
-        const updates: Record<string, string> = {};
-        const front = arg(args, "front");
-        const back = arg(args, "back");
-        const tags = arg(args, "tags");
-        if (front) updates.front = front;
-        if (back) updates.back = back;
+        const updates: {
+          front?: string;
+          back?: string;
+          tags?: string;
+          category?: string | null;
+        } = {};
+        const front = arg<string>(args, "front");
+        const back = arg<string>(args, "back");
+        const tags = arg<string>(args, "tags");
+        const category = arg<string | null>(args, "category");
+        if (front != null) updates.front = front;
+        if (back != null) updates.back = back;
         if (tags !== undefined) updates.tags = tags;
+        if (category !== undefined) updates.category = category;
         const updated = await updateCard(reqArg(args, "cardId"), updates);
         return {
           content: [
@@ -542,6 +570,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const cards = await listCards({
           deckId: arg(args, "deckId"),
           tagFilter: arg(args, "tagFilter"),
+          category: arg<string>(args, "category"),
           limit: arg<number>(args, "limit"),
           offset: arg<number>(args, "offset"),
         });
@@ -559,6 +588,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   front: trunc(c.front),
                   back: trunc(c.back),
                   tags: parseTags(c.tags),
+                  category: c.category,
                   maturity: c.maturity,
                   lapses: c.lapses,
                 })),
@@ -579,6 +609,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const results = await searchCards(reqArg(args, "query"), {
           deckId: arg(args, "deckId"),
           tags: arg<string[]>(args, "tags"),
+          category: arg<string>(args, "category"),
         });
         return {
           content: [

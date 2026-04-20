@@ -21,6 +21,7 @@ model Card {
   front      String
   back       String
   tags       String    @default("")
+  category   String?
   type       String    @default("guided")
   maturity   String    @default("new")
   source     String?
@@ -44,6 +45,7 @@ model Card {
   @@index([deckId])
   @@index([due])
   @@index([state])
+  @@index([category])
 }
 
 model Review {
