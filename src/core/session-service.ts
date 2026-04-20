@@ -29,17 +29,17 @@ interface StartSessionResult {
 }
 
 export async function startSession(
-  configOverrides?: Partial<MasterConfig>
+  configOverrides?: Partial<MasterConfig> & { category?: string }
 ): Promise<StartSessionResult> {
   const db = getDb();
 
-  // Load persisted config or use defaults
+  const { category, ...configOnly } = configOverrides ?? {};
+  const categoryFilter = category != null && category !== "" ? category : undefined;
+
   const savedConfig = await db.config.findUnique({ where: { id: "default" } });
-  const filteredOverrides = configOverrides
-    ? (Object.fromEntries(
-        Object.entries(configOverrides as Record<string, unknown>).filter(([, v]) => v !== undefined)
-      ) as Partial<MasterConfig>)
-    : {};
+  const filteredOverrides = Object.fromEntries(
+    Object.entries(configOnly as Record<string, unknown>).filter(([, v]) => v !== undefined)
+  ) as Partial<MasterConfig>;
   const config: MasterConfig = {
     ...DEFAULT_CONFIG,
     ...(savedConfig
@@ -55,7 +55,12 @@ export async function startSession(
   const now = new Date();
 
   const dueReviewCards = await db.card.findMany({
-    where: { due: { lte: now }, suspended: false, state: { not: State.New } },
+    where: {
+      due: { lte: now },
+      suspended: false,
+      state: { not: State.New },
+      ...(categoryFilter !== undefined ? { category: categoryFilter } : {}),
+    },
     orderBy: { due: "asc" },
   });
 
@@ -78,7 +83,11 @@ export async function startSession(
   }
 
   const newCards = await db.card.findMany({
-    where: { state: State.New, suspended: false },
+    where: {
+      state: State.New,
+      suspended: false,
+      ...(categoryFilter !== undefined ? { category: categoryFilter } : {}),
+    },
     orderBy: { createdAt: "asc" },
     take: maxNew,
   });
@@ -203,14 +212,22 @@ export async function adjustSession(
     remaining = remaining.slice(0, adjustment.maxCards);
   }
 
-  if (adjustment.focusDeck) {
+  const cardFilter: Record<string, unknown> = {};
+  if (adjustment.focusDeck != null && adjustment.focusDeck !== "") {
+    cardFilter.deckId = adjustment.focusDeck;
+  }
+  if (adjustment.focusCategory != null && adjustment.focusCategory !== "") {
+    cardFilter.category = adjustment.focusCategory;
+  }
+
+  if (Object.keys(cardFilter).length > 0 && remaining.length > 0) {
     const db = getDb();
-    const deckCards = await db.card.findMany({
-      where: { deckId: adjustment.focusDeck },
+    const matches = await db.card.findMany({
+      where: { ...cardFilter, id: { in: remaining.map((item) => item.cardId) } },
       select: { id: true },
     });
-    const deckCardIds = new Set(deckCards.map((c) => c.id));
-    remaining = remaining.filter((item) => deckCardIds.has(item.cardId));
+    const matchIds = new Set(matches.map((c) => c.id));
+    remaining = remaining.filter((item) => matchIds.has(item.cardId));
   }
 
   if (state) {

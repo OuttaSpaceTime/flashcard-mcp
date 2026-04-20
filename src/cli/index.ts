@@ -3,8 +3,8 @@
 import { Command } from "commander";
 import { createClient, setDb } from "../db/client.js";
 import { createDeck, listDecks, getDeckStats, getDeckByName, getOrCreateDeck } from "../core/deck-service.js";
-import { parseTags } from "../core/types.js";
-import { createCard, searchCards, backfillEmbeddings } from "../core/card-service.js";
+import { parseTags, KNOWN_CATEGORIES, isKnownCategory } from "../core/types.js";
+import { createCard, searchCards, backfillEmbeddings, updateCard } from "../core/card-service.js";
 import { initEmbeddings } from "../core/embeddings.js";
 import {
   startSession,
@@ -30,6 +30,14 @@ function defaultDbPath(): string {
 // Initialize Prisma
 const prisma = createClient();
 setDb(prisma);
+
+function warnIfUnknownCategory(name: string): void {
+  if (!isKnownCategory(name)) {
+    console.log(
+      `  Note: "${name}" is not in the known list (${KNOWN_CATEGORIES.join(", ")}). Using it anyway.`
+    );
+  }
+}
 
 const program = new Command();
 
@@ -105,6 +113,7 @@ cardsCmd
   .requiredOption("-b, --back <text>", "Card back (answer)")
   .option("-t, --tags <tags>", "Comma-separated tags")
   .option("--type <type>", "Card type: guided or unguided", "guided")
+  .option("-c, --category <name>", "Card category (e.g. work, personal)")
   .action(async (deckName: string, opts) => {
     const deck = await getDeckByName(deckName);
     if (!deck) {
@@ -112,12 +121,16 @@ cardsCmd
       process.exit(1);
     }
 
+    const category = typeof opts.category === "string" ? opts.category : undefined;
+    if (category !== undefined) warnIfUnknownCategory(category);
+
     const { card, duplicateWarning } = await createCard({
       deckId: deck.id,
       front: opts.front,
       back: opts.back,
       tags: opts.tags ? opts.tags.split(",").map((t: string) => t.trim()) : undefined,
       type: opts.type,
+      category,
       checkDuplicates: true,
     });
 
@@ -131,6 +144,8 @@ cardsCmd
   .command("list")
   .description("List cards")
   .option("-d, --deck <deck>", "Filter by deck name")
+  .option("-c, --category <name>", "Filter by category (e.g. work, personal)")
+  .option("--uncategorized", "Show only cards with no category")
   .option("--due", "Show only due cards")
   .action(async (opts) => {
     const db = prisma;
@@ -147,6 +162,10 @@ cardsCmd
     const where: Record<string, unknown> = {};
     if (deckId) where.deckId = deckId;
     if (opts.due) where.due = { lte: new Date() };
+    if (opts.uncategorized === true) where.category = null;
+    else if (typeof opts.category === "string" && opts.category !== "") {
+      where.category = opts.category;
+    }
 
     const cards = await db.card.findMany({
       where,
@@ -163,7 +182,8 @@ cardsCmd
     console.log(`\n${cards.length} cards:\n`);
     for (const card of cards) {
       const state = ["New", "Learning", "Review", "Relearning"][card.state] ?? "?";
-      console.log(`  [${state}] ${card.front.slice(0, 60)} (${card.deck.name}) - ${card.maturity}`);
+      const cat = card.category != null ? ` {${card.category}}` : "";
+      console.log(`  [${state}] ${card.front.slice(0, 60)} (${card.deck.name})${cat} - ${card.maturity}`);
     }
     console.log();
   });
@@ -186,16 +206,93 @@ cardsCmd
     }
   });
 
+// --- categories ---
+const categoriesCmd = program
+  .command("categories")
+  .description("Manage card categories (e.g. work, personal)");
+
+categoriesCmd
+  .command("list")
+  .description("List all categories in use, with card counts")
+  .action(async () => {
+    const db = prisma;
+    const rows = await db.card.groupBy({
+      by: ["category"],
+      _count: { _all: true },
+    });
+
+    if (rows.length === 0) {
+      console.log("No cards yet.");
+      return;
+    }
+
+    const inUse = new Set(
+      rows
+        .map((r) => r.category)
+        .filter((c): c is string => c != null)
+    );
+
+    console.log("\nCategories:\n");
+    for (const row of rows) {
+      const label = row.category ?? "(uncategorized)";
+      const known = row.category != null && isKnownCategory(row.category) ? " [known]" : "";
+      console.log(`  ${label}: ${row._count._all} card(s)${known}`);
+    }
+
+    const unusedKnown = KNOWN_CATEGORIES.filter((k) => !inUse.has(k));
+    if (unusedKnown.length > 0) {
+      console.log(`\n  Known but unused: ${unusedKnown.join(", ")}`);
+    }
+    console.log();
+  });
+
+categoriesCmd
+  .command("add <name>")
+  .description("Apply a category to cards (by deck or card id)")
+  .option("-d, --deck <deck>", "Deck name: apply to all cards in this deck")
+  .option("--card <id>", "Card id: apply to a single card")
+  .action(async (name: string, opts: { deck?: string; card?: string }) => {
+    const hasCard = opts.card != null && opts.card !== "";
+    const hasDeck = opts.deck != null && opts.deck !== "";
+    if (hasCard === hasDeck) {
+      console.error("Specify exactly one of --card <id> or --deck <name>.");
+      process.exit(1);
+    }
+    warnIfUnknownCategory(name);
+
+    if (hasCard) {
+      await updateCard(opts.card!, { category: name });
+      console.log(`  Set category "${name}" on card ${opts.card!}`);
+      return;
+    }
+
+    const deck = await getDeckByName(opts.deck!);
+    if (!deck) {
+      console.error(`Deck "${opts.deck!}" not found.`);
+      process.exit(1);
+    }
+    const res = await prisma.card.updateMany({
+      where: { deckId: deck.id },
+      data: { category: name },
+    });
+    console.log(`  Set category "${name}" on ${res.count} card(s) in deck ${opts.deck!}`);
+  });
+
 // --- study ---
 program
   .command("study")
   .description("Start an interactive study session")
   .option("-d, --deck <deck>", "Focus on a specific deck")
+  .option("-c, --category <name>", "Only study cards of this category (e.g. work, personal)")
   .option("-l, --limit <n>", "Max cards", "20")
   .action(async (opts) => {
+    const category = typeof opts.category === "string" && opts.category !== ""
+      ? opts.category
+      : undefined;
     const session = await startSession({
       maxNewCardsPerSession: Math.min(parseInt(opts.limit), 5),
       maxReviewCardsPerSession: parseInt(opts.limit),
+      category,
     });
 
     if (session.queue.length === 0) {

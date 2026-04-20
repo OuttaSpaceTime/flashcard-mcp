@@ -309,5 +309,47 @@ describe("session-service", () => {
       const adjusted = await adjustSession(session.id, { maxCards: 2 });
       expect(adjusted.queue.length).toBeLessThanOrEqual(2);
     });
+
+    it("narrows queue to a focus category", async () => {
+      const db = getDb();
+      await seedCards(2);
+      const cards = await db.card.findMany();
+      await db.card.update({ where: { id: cards[0].id }, data: { category: "work" } });
+      await db.card.update({ where: { id: cards[1].id }, data: { category: "personal" } });
+
+      const session = await startSession();
+      expect(session.queue.length).toBe(2);
+
+      const adjusted = await adjustSession(session.id, { focusCategory: "work" });
+      expect(adjusted.queue.length).toBe(1);
+      const remaining = await db.card.findUnique({ where: { id: adjusted.queue[0].cardId } });
+      expect(remaining!.category).toBe("work");
+    });
+  });
+
+  describe("startSession category filter", () => {
+    it("only includes cards matching the requested category", async () => {
+      const db = getDb();
+      await seedCards(3);
+      const cards = await db.card.findMany();
+      await db.card.update({ where: { id: cards[0].id }, data: { category: "work" } });
+      await db.card.update({ where: { id: cards[1].id }, data: { category: "personal" } });
+
+      const session = await startSession({ category: "work" });
+      expect(session.queue.length).toBe(1);
+      const queued = await db.card.findUnique({ where: { id: session.queue[0].cardId } });
+      expect(queued!.category).toBe("work");
+    });
+
+    it("includes all cards when no category filter given", async () => {
+      const db = getDb();
+      await seedCards(3);
+      const cards = await db.card.findMany();
+      await db.card.update({ where: { id: cards[0].id }, data: { category: "work" } });
+      await db.card.update({ where: { id: cards[1].id }, data: { category: "personal" } });
+
+      const session = await startSession();
+      expect(session.queue.length).toBe(3);
+    });
   });
 });
