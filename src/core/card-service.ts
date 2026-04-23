@@ -38,6 +38,15 @@ function applyCategoryFilter(where: Record<string, unknown>, cat: string | undef
   else if (cat != null && cat !== "") where.category = cat;
 }
 
+export const CARD_STATE_BY_NAME: Record<string, number> = {
+  new: 0,
+  learning: 1,
+  review: 2,
+  relearning: 3,
+};
+
+export type CardStateName = keyof typeof CARD_STATE_BY_NAME;
+
 function scheduleEmbeddingUpdate(cardId: string, front: string, back: string): void {
   const db = getDb();
   void getEmbedding(cardEmbeddingText(front, back)).then((emb) => {
@@ -192,6 +201,7 @@ export async function listCards(filters: {
   deckId?: string;
   tagFilter?: "empty" | "has_any" | string;
   category?: string;
+  state?: CardStateName | string;
   limit?: number;
   offset?: number;
 }): Promise<PrismaCard[]> {
@@ -202,6 +212,15 @@ export async function listCards(filters: {
   const where: Record<string, unknown> = {};
   if (filters.deckId != null && filters.deckId !== "") {
     where.deckId = filters.deckId;
+  }
+
+  if (filters.state != null && filters.state !== "") {
+    if (!Object.prototype.hasOwnProperty.call(CARD_STATE_BY_NAME, filters.state)) {
+      throw new Error(
+        `Invalid state "${filters.state}". Expected one of: ${Object.keys(CARD_STATE_BY_NAME).join(", ")}`
+      );
+    }
+    where.state = CARD_STATE_BY_NAME[filters.state];
   }
 
   applyCategoryFilter(where, filters.category);

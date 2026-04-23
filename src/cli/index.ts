@@ -4,7 +4,7 @@ import { Command } from "commander";
 import { createClient, setDb } from "../db/client.js";
 import { createDeck, listDecks, getDeckStats, getDeckByName, getOrCreateDeck } from "../core/deck-service.js";
 import { parseTags, KNOWN_CATEGORIES, isKnownCategory } from "../core/types.js";
-import { createCard, searchCards, backfillEmbeddings, updateCard } from "../core/card-service.js";
+import { createCard, searchCards, backfillEmbeddings, updateCard, CARD_STATE_BY_NAME } from "../core/card-service.js";
 import { initEmbeddings } from "../core/embeddings.js";
 import {
   startSession,
@@ -147,6 +147,8 @@ cardsCmd
   .option("-c, --category <name>", "Filter by category (e.g. work, personal)")
   .option("--uncategorized", "Show only cards with no category")
   .option("--due", "Show only due cards")
+  .option("--state <name>", "Filter by FSRS state: new | learning | review | relearning")
+  .option("--limit <n>", "Max rows to return (default 50, max 200)")
   .action(async (opts) => {
     const db = prisma;
     let deckId: string | undefined;
@@ -166,11 +168,23 @@ cardsCmd
     else if (typeof opts.category === "string" && opts.category !== "") {
       where.category = opts.category;
     }
+    if (typeof opts.state === "string" && opts.state !== "") {
+      if (!(opts.state in CARD_STATE_BY_NAME)) {
+        console.error(
+          `Invalid --state "${opts.state}". Expected one of: ${Object.keys(CARD_STATE_BY_NAME).join(", ")}`
+        );
+        process.exit(1);
+      }
+      where.state = CARD_STATE_BY_NAME[opts.state];
+    }
+
+    const rawLimit = opts.limit != null ? Number(opts.limit) : 50;
+    const take = Math.max(1, Math.min(Number.isFinite(rawLimit) ? rawLimit : 50, 200));
 
     const cards = await db.card.findMany({
       where,
       include: { deck: { select: { name: true } } },
-      take: 50,
+      take,
       orderBy: { due: "asc" },
     });
 
@@ -179,9 +193,13 @@ cardsCmd
       return;
     }
 
+    const stateLabels = Object.entries(CARD_STATE_BY_NAME)
+      .sort(([, a], [, b]) => a - b)
+      .map(([k]) => k[0].toUpperCase() + k.slice(1));
+
     console.log(`\n${cards.length} cards:\n`);
     for (const card of cards) {
-      const state = ["New", "Learning", "Review", "Relearning"][card.state] ?? "?";
+      const state = stateLabels[card.state] ?? "?";
       const cat = card.category != null ? ` {${card.category}}` : "";
       console.log(`  [${state}] ${card.front.slice(0, 60)} (${card.deck.name})${cat} - ${card.maturity}`);
     }
