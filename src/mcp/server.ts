@@ -6,7 +6,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { createClient, setDb } from "../db/client.js";
+import { createClient, setDb, getDb } from "../db/client.js";
 import { listDecks, getDeckStats, deleteDeck } from "../core/deck-service.js";
 import {
   createCard,
@@ -282,7 +282,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "get_due_cards",
-      description: "Get count and preview of cards due for review.",
+      description:
+        "Returns the total number of cards due now plus a preview of up to 30 (ordered by due date ascending). `totalDue` is the real backlog size; `preview` may be shorter. If you need every due card, use list_cards with additional filters.",
       inputSchema: { type: "object" as const, properties: {} },
     },
     {
@@ -637,14 +638,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "get_due_cards": {
-        const dueCards = await getDueCards(30);
+        const db = getDb();
+        const previewLimit = 30;
+        const [totalDue, dueCards] = await Promise.all([
+          db.card.count({ where: { due: { lte: new Date() }, suspended: false } }),
+          getDueCards(previewLimit),
+        ]);
         return {
           content: [
             {
               type: "text",
               text: JSON.stringify({
-                count: dueCards.length,
-                cards: dueCards.map((c) => ({
+                totalDue,
+                previewCount: dueCards.length,
+                hasMore: totalDue > dueCards.length,
+                preview: dueCards.map((c) => ({
                   id: c.id,
                   front: c.front.slice(0, 80),
                   deck: c.deck.name,
