@@ -336,6 +336,47 @@ describe("card-service", () => {
       expect(results.length).toBe(1);
       expect(results[0].front).toBe("InDeck1");
     });
+
+    it("filters by state=new", async () => {
+      const db = getDb();
+      const { card: c1 } = await createCard({ deckId: testDeckId, front: "NewQ", back: "A" });
+      const { card: c2 } = await createCard({ deckId: testDeckId, front: "ReviewQ", back: "A" });
+      await db.card.update({ where: { id: c2.id }, data: { state: 2 } });
+
+      const results = await listCards({ state: "new" });
+      expect(results.length).toBe(1);
+      expect(results[0].id).toBe(c1.id);
+      expect(results[0].front).toBe("NewQ");
+
+      const reviewResults = await listCards({ state: "review" });
+      expect(reviewResults.length).toBe(1);
+      expect(reviewResults[0].id).toBe(c2.id);
+    });
+
+    it("combines state and deckId filters with AND", async () => {
+      const db = getDb();
+      const deck2 = await db.deck.create({ data: { name: "Other" } });
+      const { card: inDeck1New } = await createCard({
+        deckId: testDeckId,
+        front: "InDeck1New",
+        back: "A",
+      });
+      const { card: inDeck1Rev } = await createCard({
+        deckId: testDeckId,
+        front: "InDeck1Rev",
+        back: "A",
+      });
+      await db.card.update({ where: { id: inDeck1Rev.id }, data: { state: 2 } });
+      await createCard({ deckId: deck2.id, front: "InDeck2New", back: "A" });
+
+      const results = await listCards({ deckId: testDeckId, state: "new" });
+      expect(results.length).toBe(1);
+      expect(results[0].id).toBe(inDeck1New.id);
+    });
+
+    it("throws on invalid state name", async () => {
+      await expect(listCards({ state: "bogus" })).rejects.toThrow(/Invalid state/);
+    });
   });
 
   describe("category", () => {

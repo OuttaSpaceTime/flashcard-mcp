@@ -230,7 +230,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "list_cards",
       description:
-        "List cards with optional deck/tag filters and pagination. tagFilter accepts 'empty' (untagged), 'has_any' (any tag), or an exact tag string. Returns id, truncated front/back, tags array, maturity, lapses, deckId. Default limit 50 (max 200).",
+        "List cards with optional deck/tag/state filters and pagination. tagFilter accepts 'empty' (untagged), 'has_any' (any tag), or an exact tag string. state filters by FSRS state. Returns id, truncated front/back, tags array, maturity, lapses, deckId. Default limit 50 (max 200).",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -243,6 +243,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             description:
               "Exact category name, or '__uncategorized__' for null, or '__any__' for any category.",
+          },
+          state: {
+            type: "string",
+            enum: ["new", "learning", "review", "relearning"],
+            description: "Filter by FSRS state.",
           },
           limit: { type: "number" },
           offset: { type: "number" },
@@ -571,6 +576,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           deckId: arg(args, "deckId"),
           tagFilter: arg(args, "tagFilter"),
           category: arg<string>(args, "category"),
+          state: arg<string>(args, "state"),
           limit: arg<number>(args, "limit"),
           offset: arg<number>(args, "offset"),
         });
