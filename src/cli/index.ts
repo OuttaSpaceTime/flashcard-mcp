@@ -97,7 +97,10 @@ program
       const stats = await getDeckStats(deck.id);
       console.log(`  ${deck.name} (${stats.totalCards} cards)`);
       console.log(
-        `    Due: ${stats.dueCards} | New: ${stats.newCards} | Learning: ${stats.learningCards} | Review: ${stats.reviewCards}`
+        `    Due: ${stats.dueCards} | New: ${stats.newCards} | Learning: ${stats.learningCards} | Review: ${stats.reviewCards} | Relearning: ${stats.relearningCards}`
+      );
+      console.log(
+        `    Due breakdown: ${stats.dueNew} new | ${stats.dueLearning} learning | ${stats.dueReview} review | ${stats.dueRelearning} relearning`
       );
     }
     console.log();

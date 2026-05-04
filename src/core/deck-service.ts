@@ -30,17 +30,24 @@ export async function getDeckStats(deckId: string): Promise<DeckStats> {
   const db = getDb();
   const now = new Date();
 
-  const [deck, totalCards, dueCards, stateCounts] = await Promise.all([
+  const [deck, totalCards, dueCards, stateCounts, dueStateCounts] = await Promise.all([
     db.deck.findUnique({ where: { id: deckId } }),
     db.card.count({ where: { deckId } }),
     db.card.count({ where: { deckId, due: { lte: now }, suspended: false } }),
     db.card.groupBy({ by: ["state"], where: { deckId }, _count: { _all: true } }),
+    db.card.groupBy({
+      by: ["state"],
+      where: { deckId, due: { lte: now }, suspended: false },
+      _count: { _all: true },
+    }),
   ]);
 
   if (!deck) throw new Error(`Deck not found: ${deckId}`);
 
   const countByState = (state: State) =>
     stateCounts.find((r) => r.state === state)?._count._all ?? 0;
+  const dueByState = (state: State) =>
+    dueStateCounts.find((r) => r.state === state)?._count._all ?? 0;
 
   return {
     id: deck.id,
@@ -52,6 +59,10 @@ export async function getDeckStats(deckId: string): Promise<DeckStats> {
     learningCards: countByState(State.Learning),
     reviewCards: countByState(State.Review),
     relearningCards: countByState(State.Relearning),
+    dueNew: dueByState(State.New),
+    dueLearning: dueByState(State.Learning),
+    dueReview: dueByState(State.Review),
+    dueRelearning: dueByState(State.Relearning),
   };
 }
 

@@ -55,6 +55,10 @@ export interface DeckStats {
   learningCards: number;
   reviewCards: number;
   relearningCards: number;
+  dueNew: number;
+  dueLearning: number;
+  dueReview: number;
+  dueRelearning: number;
 }
 
 export function parseTags(tagsStr: string): string[] {

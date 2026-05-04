@@ -112,6 +112,42 @@ describe("deck-service", () => {
       const stats = await getDeckStats(deck.id);
       expect(stats.dueCards).toBe(1);
     });
+
+    it("breaks due cards down by state", async () => {
+      const deck = await createDeck("React");
+      const db = getDb();
+      const past = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      const future = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+      // Due: 1 new + 1 review + 1 relearning. Not due: 1 review (future), 1 learning (future).
+      await db.card.create({ data: { deckId: deck.id, front: "N1", back: "A", state: 0, due: past } });
+      await db.card.create({ data: { deckId: deck.id, front: "R1", back: "A", state: 2, due: past } });
+      await db.card.create({ data: { deckId: deck.id, front: "RL1", back: "A", state: 3, due: past } });
+      await db.card.create({ data: { deckId: deck.id, front: "R2", back: "A", state: 2, due: future } });
+      await db.card.create({ data: { deckId: deck.id, front: "L1", back: "A", state: 1, due: future } });
+
+      const stats = await getDeckStats(deck.id);
+      expect(stats.dueCards).toBe(3);
+      expect(stats.dueNew).toBe(1);
+      expect(stats.dueLearning).toBe(0);
+      expect(stats.dueReview).toBe(1);
+      expect(stats.dueRelearning).toBe(1);
+    });
+
+    it("excludes suspended cards from due-by-state breakdown", async () => {
+      const deck = await createDeck("React");
+      const db = getDb();
+      const past = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+      await db.card.create({ data: { deckId: deck.id, front: "Q1", back: "A", state: 2, due: past } });
+      await db.card.create({
+        data: { deckId: deck.id, front: "Q2", back: "A", state: 2, due: past, suspended: true },
+      });
+
+      const stats = await getDeckStats(deck.id);
+      expect(stats.dueCards).toBe(1);
+      expect(stats.dueReview).toBe(1);
+    });
   });
 
   describe("deleteDeck", () => {
