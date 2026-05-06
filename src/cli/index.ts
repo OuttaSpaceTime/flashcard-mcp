@@ -3,7 +3,7 @@
 import { Command } from "commander";
 import { createClient, setDb } from "../db/client.js";
 import { createDeck, listDecks, getDeckStats, getDeckByName, getOrCreateDeck } from "../core/deck-service.js";
-import { parseTags, KNOWN_CATEGORIES, isKnownCategory } from "../core/types.js";
+import { parseTags } from "../core/types.js";
 import { createCard, searchCards, backfillEmbeddings, updateCard, CARD_STATE_BY_NAME } from "../core/card-service.js";
 import { initEmbeddings } from "../core/embeddings.js";
 import {
@@ -30,14 +30,6 @@ function defaultDbPath(): string {
 // Initialize Prisma
 const prisma = createClient();
 setDb(prisma);
-
-function warnIfUnknownCategory(name: string): void {
-  if (!isKnownCategory(name)) {
-    console.log(
-      `  Note: "${name}" is not in the known list (${KNOWN_CATEGORIES.join(", ")}). Using it anyway.`
-    );
-  }
-}
 
 const program = new Command();
 
@@ -116,7 +108,7 @@ cardsCmd
   .requiredOption("-b, --back <text>", "Card back (answer)")
   .option("-t, --tags <tags>", "Comma-separated tags")
   .option("--type <type>", "Card type: guided or unguided", "guided")
-  .option("-c, --category <name>", "Card category (e.g. work, personal)")
+  .option("-c, --category <name>", "Card category")
   .action(async (deckName: string, opts) => {
     const deck = await getDeckByName(deckName);
     if (!deck) {
@@ -125,7 +117,6 @@ cardsCmd
     }
 
     const category = typeof opts.category === "string" ? opts.category : undefined;
-    if (category !== undefined) warnIfUnknownCategory(category);
 
     const { card, duplicateWarning } = await createCard({
       deckId: deck.id,
@@ -147,7 +138,7 @@ cardsCmd
   .command("list")
   .description("List cards")
   .option("-d, --deck <deck>", "Filter by deck name")
-  .option("-c, --category <name>", "Filter by category (e.g. work, personal)")
+  .option("-c, --category <name>", "Filter by category")
   .option("--uncategorized", "Show only cards with no category")
   .option("--due", "Show only due cards")
   .option("--state <name>", "Filter by FSRS state: new | learning | review | relearning")
@@ -230,7 +221,7 @@ cardsCmd
 // --- categories ---
 const categoriesCmd = program
   .command("categories")
-  .description("Manage card categories (e.g. work, personal)");
+  .description("Manage card categories");
 
 categoriesCmd
   .command("list")
@@ -247,22 +238,10 @@ categoriesCmd
       return;
     }
 
-    const inUse = new Set(
-      rows
-        .map((r) => r.category)
-        .filter((c): c is string => c != null)
-    );
-
     console.log("\nCategories:\n");
     for (const row of rows) {
       const label = row.category ?? "(uncategorized)";
-      const known = row.category != null && isKnownCategory(row.category) ? " [known]" : "";
-      console.log(`  ${label}: ${row._count._all} card(s)${known}`);
-    }
-
-    const unusedKnown = KNOWN_CATEGORIES.filter((k) => !inUse.has(k));
-    if (unusedKnown.length > 0) {
-      console.log(`\n  Known but unused: ${unusedKnown.join(", ")}`);
+      console.log(`  ${label}: ${row._count._all} card(s)`);
     }
     console.log();
   });
@@ -279,7 +258,6 @@ categoriesCmd
       console.error("Specify exactly one of --card <id> or --deck <name>.");
       process.exit(1);
     }
-    warnIfUnknownCategory(name);
 
     if (hasCard) {
       await updateCard(opts.card!, { category: name });
@@ -304,7 +282,7 @@ program
   .command("study")
   .description("Start an interactive study session")
   .option("-d, --deck <deck>", "Focus on a specific deck")
-  .option("-c, --category <name>", "Only study cards of this category (e.g. work, personal)")
+  .option("-c, --category <name>", "Only study cards of this category")
   .option("-l, --limit <n>", "Max cards", "20")
   .action(async (opts) => {
     const category = typeof opts.category === "string" && opts.category !== ""

@@ -59,7 +59,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           practiceFirst: { type: "boolean", description: "Prioritize unguided/exercise cards" },
           category: {
             type: "string",
-            description: "Only include cards with this category (e.g. 'work', 'personal'). Omit for all cards.",
+            description: "Only include cards with this category. Omit for all cards.",
           },
         },
       },
@@ -160,7 +160,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           back: { type: "string" },
           tags: { type: "array", items: { type: "string" } },
           type: { type: "string", enum: ["guided", "unguided"] },
-          category: { type: "string", description: "Card category, e.g. 'work' or 'personal'" },
+          category: { type: "string", description: "Card category" },
         },
         required: ["deckId", "front", "back"],
       },
