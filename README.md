@@ -9,7 +9,7 @@ A spaced-repetition flashcard system with an MCP server and CLI, built on TypeSc
 - **CLI** — `init`, `decks`, `cards`, `categories`, `study`, `stats`, `topics`, `import`, `export`, `embeddings`, `db:dump`, `db:restore`
 - **Semantic duplicate detection** — two-stage Jaccard + cosine similarity on 384-dim embeddings
 - **Anki interop** — import/export `.apkg` (including zstd-compressed `collection.anki21b`) with full scheduling, plus plain-text `.txt`
-- **Categories** — tag cards as e.g. `work` or `personal` and filter sessions/lists accordingly
+- **Categories** — tag cards with a free-form category and filter sessions/lists accordingly
 - **Anti-overload** — caps new cards at 5 and reviews at 15 per session; card creation requires explicit approval
 
 ## Setup
@@ -27,11 +27,11 @@ npm run dev:cli -- init # create default decks
 npm run dev:cli -- init                       # create default decks + config
 npm run dev:cli -- decks                      # list decks with stats
 npm run dev:cli -- cards add <deck> -f ... -b ...   # add a card
-npm run dev:cli -- cards list [--deck X] [--category work] [--uncategorized] [--due]
+npm run dev:cli -- cards list [--deck X] [--category <name>] [--uncategorized] [--due]
 npm run dev:cli -- cards search <query>
 npm run dev:cli -- categories list            # categories in use, with counts
 npm run dev:cli -- categories add <name> --deck X | --card <id>
-npm run dev:cli -- study [--deck X] [--category work] [--limit N]
+npm run dev:cli -- study [--deck X] [--category <name>] [--limit N]
 npm run dev:cli -- stats                      # streak, retention, maturity, lapses
 npm run dev:cli -- topics                     # maturity report per deck
 npm run dev:cli -- import <file> [--deck X] [--ours|--theirs] [--dry-run]
