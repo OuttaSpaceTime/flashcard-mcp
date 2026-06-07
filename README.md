@@ -125,6 +125,16 @@ npm run dev:cli -- export cards.txt                     # export all cards
 
 Tab-separated format with `#separator`, `#html`, and `#tags` header directives. No scheduling data — cards are imported as new. The same `--ours`/`--theirs` conflict flags apply.
 
+### AnkiWeb sync (external)
+
+Live sync to AnkiWeb (for reviewing on the phone) is handled by [`scripts/anki-sync` in the study repo](../study), not by this codebase. It reads and writes `prisma/master.db` directly via SQLite and talks to AnkiWeb through a headless Anki bridge collection (fastanki / official `anki` Python package). The contract:
+
+- **One-way card push** — this repo owns card existence and content; the Anki note `guid` is the card's full CUID (note: the `.apkg` export above uses a different, truncated guid scheme).
+- **Bidirectional scheduling** — the side with the newer last review wins its whole FSRS block; `stability`/`difficulty` map natively to Anki's `memory_state`, no SM-2 conversion.
+- **Append-only review history** — revlog and the `Review` table are unioned by (card, timestamp).
+
+Implications for this codebase: keep card CUIDs stable, and treat `Card` scheduling fields and `Review` rows as writable by the external sync (short transactions, ISO-8601 or legacy epoch-ms datetimes both occur in existing data).
+
 ## Development
 
 ```bash
