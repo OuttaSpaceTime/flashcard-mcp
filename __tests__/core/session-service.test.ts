@@ -168,8 +168,8 @@ describe("session-service", () => {
       const first = await getNextCard(session.id);
       expect(first).not.toBeNull();
 
-      // Submit review to advance queue
-      await submitReview(session.id, first!.id, Rating.Good);
+      // Easy graduates the new card past the intra-day learning steps
+      await submitReview(session.id, first!.id, Rating.Easy);
 
       const second = await getNextCard(session.id);
       expect(second).toBeNull();
@@ -253,7 +253,7 @@ describe("session-service", () => {
       const session = await startSession();
 
       const card = await getNextCard(session.id);
-      await submitReview(session.id, card!.id, Rating.Good);
+      await submitReview(session.id, card!.id, Rating.Easy);
 
       // First call after exhaustion
       expect(await getNextCard(session.id)).toBeNull();
@@ -298,6 +298,80 @@ describe("session-service", () => {
 
       const card = await getNextCard(session.id);
       expect(card).toBeNull();
+    });
+  });
+
+  describe("intra-day learning-step re-queue", () => {
+    function seedReviewCard() {
+      return seedCards(1, {
+        state: State.Review,
+        due: new Date(Date.now() - 24 * 60 * 60 * 1000),
+        stability: 5,
+        lastReview: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),
+      });
+    }
+
+    it("re-serves a review card rated Again in the same session", async () => {
+      await seedReviewCard();
+      const session = await startSession();
+
+      const card = await getNextCard(session.id);
+      await submitReview(session.id, card!.id, Rating.Again);
+
+      const repeat = await getNextCard(session.id);
+      expect(repeat).not.toBeNull();
+      expect(repeat!.id).toBe(card!.id);
+    });
+
+    it("re-serves a new card rated Good (10-minute learning step)", async () => {
+      await seedCards(1);
+      const session = await startSession();
+
+      const card = await getNextCard(session.id);
+      await submitReview(session.id, card!.id, Rating.Good);
+
+      const repeat = await getNextCard(session.id);
+      expect(repeat).not.toBeNull();
+      expect(repeat!.id).toBe(card!.id);
+    });
+
+    it("does not re-queue a card whose next interval is a day or more", async () => {
+      await seedReviewCard();
+      const session = await startSession();
+
+      const card = await getNextCard(session.id);
+      await submitReview(session.id, card!.id, Rating.Good);
+
+      expect(await getNextCard(session.id)).toBeNull();
+    });
+
+    it("repeats until the card graduates out of intra-day steps", async () => {
+      await seedReviewCard();
+      const session = await startSession();
+
+      // Again → relearning (minutes) → repeat served
+      const card = await getNextCard(session.id);
+      await submitReview(session.id, card!.id, Rating.Again);
+
+      const repeat = await getNextCard(session.id);
+      expect(repeat!.id).toBe(card!.id);
+
+      // Good on the repeat graduates back to Review (≥ 1 day) → queue ends
+      await submitReview(session.id, repeat!.id, Rating.Good);
+      expect(await getNextCard(session.id)).toBeNull();
+    });
+
+    it("marks the re-queued item with the learning_repeat reason", async () => {
+      await seedReviewCard();
+      const session = await startSession();
+
+      const card = await getNextCard(session.id);
+      await submitReview(session.id, card!.id, Rating.Again);
+
+      const { queue } = await adjustSession(session.id, {});
+      expect(queue).toEqual([
+        { cardId: card!.id, reason: "learning_repeat" },
+      ]);
     });
   });
 

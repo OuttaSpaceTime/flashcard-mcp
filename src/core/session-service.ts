@@ -175,6 +175,13 @@ export async function submitReview(
   if (state) {
     state.goodCount += isGood ? 1 : 0;
     state.pointer += 1;
+
+    // Re-queue intra-day learning steps so the card repeats this session
+    const intraDay =
+      result.card.due.getTime() - Date.now() < 24 * 60 * 60 * 1000;
+    if (intraDay) {
+      state.queue.push({ cardId, reason: "learning_repeat" });
+    }
   }
   const reviewed = state?.pointer ?? 1;
   const goodCount = state?.goodCount ?? (isGood ? 1 : 0);
