@@ -6,3 +6,4 @@ prisma/*.db-journal
 *.tsbuildinfo
 .env
 .claude/
+prisma/*.db.bak-*

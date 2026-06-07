@@ -1,4 +1,5 @@
 import { getDb } from "../db/client.js";
+import { assertCardContent } from "./content-rules.js";
 import { createNewFsrsCard } from "./scheduler.js";
 import {
   checkDuplicate,
@@ -59,6 +60,7 @@ function scheduleEmbeddingUpdate(cardId: string, front: string, back: string): v
 }
 
 export async function createCard(input: CreateCardInput): Promise<CreateCardResult> {
+  assertCardContent({ front: input.front, back: input.back });
   const db = getDb();
   const fsrsDefaults = createNewFsrsCard();
 
@@ -165,6 +167,7 @@ export async function updateCard(
     source?: string;
   }
 ): Promise<PrismaCard> {
+  assertCardContent({ front: updates.front, back: updates.back });
   const db = getDb();
   const updated = await db.card.update({ where: { id }, data: updates });
 
