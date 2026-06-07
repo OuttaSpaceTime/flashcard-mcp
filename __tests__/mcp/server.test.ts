@@ -264,6 +264,15 @@ describe("MCP server tools (integration)", () => {
       expect(card2).not.toBeNull();
       await submitReview(session.id, card2!.id, Rating.Again);
 
+      // Both cards landed in intra-day learning steps — they repeat this session
+      const repeat1 = await getNextCard(session.id);
+      expect(repeat1!.id).toBe(card1!.id);
+      await submitReview(session.id, repeat1!.id, Rating.Easy);
+
+      const repeat2 = await getNextCard(session.id);
+      expect(repeat2!.id).toBe(card2!.id);
+      await submitReview(session.id, repeat2!.id, Rating.Easy);
+
       // No more cards — queue exhausted
       const card3 = await getNextCard(session.id);
       expect(card3).toBeNull();

@@ -29,7 +29,7 @@ export interface DuplicateCheckResult {
 
 export interface SessionQueueItem {
   cardId: string;
-  reason: "due_review" | "new_card" | "unguided_priority";
+  reason: "due_review" | "new_card" | "unguided_priority" | "learning_repeat";
 }
 
 export interface SessionAdjustment {
