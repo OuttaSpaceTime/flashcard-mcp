@@ -84,6 +84,61 @@ describe("card-service", () => {
       expect(result.duplicateWarning!.isDuplicate).toBe(true);
     });
 
+    it("inherits the source card's schedule when inheritFrom is given", async () => {
+      const db = getDb();
+      const { card: source } = await createCard({
+        deckId: testDeckId,
+        front: "Name all four dependency-vetting criteria",
+        back: "Maintenance, Popularity, Testing, Dependencies",
+      });
+
+      // Mature the source card so it has a real FSRS block to inherit.
+      const due = new Date("2026-09-11T00:00:00.000Z");
+      const lastReview = new Date("2026-06-21T00:00:00.000Z");
+      await db.card.update({
+        where: { id: source.id },
+        data: {
+          stability: 82.5,
+          difficulty: 6.3,
+          reps: 5,
+          lapses: 3,
+          state: State.Review,
+          interval: 82,
+          maturity: "review",
+          due,
+          lastReview,
+        },
+      });
+
+      const { card } = await createCard({
+        deckId: testDeckId,
+        front: "What does the Maintenance criterion check?",
+        back: "Whether the project is actively maintained",
+        inheritFrom: source.id,
+      });
+
+      expect(card.stability).toBe(82.5);
+      expect(card.difficulty).toBe(6.3);
+      expect(card.reps).toBe(5);
+      expect(card.lapses).toBe(3);
+      expect(card.state).toBe(State.Review);
+      expect(card.interval).toBe(82);
+      expect(card.maturity).toBe("review");
+      expect(card.due.getTime()).toBe(due.getTime());
+      expect(card.lastReview!.getTime()).toBe(lastReview.getTime());
+    });
+
+    it("throws when inheritFrom references a nonexistent card", async () => {
+      await expect(
+        createCard({
+          deckId: testDeckId,
+          front: "Q",
+          back: "A",
+          inheritFrom: "nonexistent-card-id",
+        })
+      ).rejects.toThrow(/inheritFrom/);
+    });
+
     it("creates card even with duplicate warning when not blocked", async () => {
       await createCard({
         deckId: testDeckId,

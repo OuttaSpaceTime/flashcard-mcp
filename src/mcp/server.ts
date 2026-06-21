@@ -151,7 +151,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "create_card",
-      description: "Create a new flashcard. Returns card and duplicate warnings.",
+      description:
+        "Create a new flashcard. Returns card and duplicate warnings. When splitting or deriving a card from an existing one, pass inheritFrom with the source card's id so the new card keeps the parent's FSRS schedule (due, stability, interval, state) instead of resetting to a fresh New card.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -161,6 +162,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           tags: { type: "array", items: { type: "string" } },
           type: { type: "string", enum: ["guided", "unguided"] },
           category: { type: "string", description: "Card category" },
+          inheritFrom: {
+            type: "string",
+            description:
+              "Source card id to inherit the FSRS scheduling block from (due, stability, difficulty, reps, lapses, state, lastReview, interval, maturity). Use when splitting a card so the new cards honour the original's stability.",
+          },
         },
         required: ["deckId", "front", "back"],
       },
@@ -473,6 +479,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           tags: arg<string[]>(args, "tags"),
           type: arg(args, "type") as "guided" | "unguided" | undefined,
           category: arg<string>(args, "category"),
+          inheritFrom: arg<string>(args, "inheritFrom"),
           checkDuplicates: true,
         });
         return {
@@ -484,6 +491,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   id: result.card.id,
                   front: result.card.front,
                   back: result.card.back,
+                  due: result.card.due,
+                  interval: result.card.interval,
+                  stability: result.card.stability,
+                  state: result.card.state,
                 },
                 duplicateWarning: result.duplicateWarning,
               }),
