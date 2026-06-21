@@ -199,6 +199,32 @@ describe("session-service", () => {
       expect(reviews[0].responseMs).toBe(2000);
     });
 
+    it("returns the new schedule (due, interval, state) for the reviewed card", async () => {
+      await seedCards(1);
+      const session = await startSession();
+      const card = await getNextCard(session.id);
+
+      const schedule = await submitReview(session.id, card!.id, Rating.Good);
+
+      const db = getDb();
+      const updatedCard = await db.card.findUnique({ where: { id: card!.id } });
+      expect(schedule.due).toBe(updatedCard!.due.toISOString());
+      expect(schedule.interval).toBe(updatedCard!.interval);
+      expect(schedule.state).toBe(updatedCard!.state);
+      expect(typeof schedule.intraDay).toBe("boolean");
+    });
+
+    it("flags intra-day learning steps in the returned schedule", async () => {
+      await seedCards(1);
+      const session = await startSession();
+      const card = await getNextCard(session.id);
+
+      // A brand-new card rated Again lands on a sub-day learning step.
+      const schedule = await submitReview(session.id, card!.id, Rating.Again);
+      expect(schedule.intraDay).toBe(true);
+      expect(schedule.interval).toBe(0);
+    });
+
     it("increments session cardsReviewed count", async () => {
       await seedCards(2);
       const session = await startSession();

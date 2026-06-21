@@ -78,7 +78,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "submit_review",
       description:
-        "Submit a rating for a card. Rating: 1=Again, 2=Hard, 3=Good, 4=Easy.",
+        "Submit a rating for a card. Rating: 1=Again, 2=Hard, 3=Good, 4=Easy. Returns the new schedule: due (ISO timestamp), interval (days, 0 for intra-day learning steps), state, and intraDay (true when the card resurfaces in under a day).",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -382,14 +382,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "submit_review": {
-        await submitReview(
+        const schedule = await submitReview(
           reqArg(args, "sessionId"),
           reqArg(args, "cardId"),
           reqArg<number>(args, "rating") as Grade,
           arg<number>(args, "responseMs")
         );
         return {
-          content: [{ type: "text", text: JSON.stringify({ success: true }) }],
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ success: true, ...schedule }),
+            },
+          ],
         };
       }
 
