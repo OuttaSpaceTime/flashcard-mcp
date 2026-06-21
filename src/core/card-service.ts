@@ -22,6 +22,13 @@ interface CreateCardInput {
   category?: string | null;
   source?: string;
   checkDuplicates?: boolean;
+  /**
+   * Card id to inherit the FSRS scheduling block from (due, stability,
+   * difficulty, reps, lapses, state, lastReview, interval, maturity). Used when
+   * splitting or otherwise deriving a card from an existing one, so the new card
+   * keeps the parent's learned schedule instead of resetting to a fresh New card.
+   */
+  inheritFrom?: string;
 }
 
 interface CreateCardResult {
@@ -62,7 +69,29 @@ function scheduleEmbeddingUpdate(cardId: string, front: string, back: string): v
 export async function createCard(input: CreateCardInput): Promise<CreateCardResult> {
   assertCardContent({ front: input.front, back: input.back });
   const db = getDb();
-  const fsrsDefaults = createNewFsrsCard();
+
+  // Scheduling block: fresh FSRS defaults, unless deriving from a parent card
+  // (split) — then inherit the parent's learned schedule so the new card keeps
+  // its place in the queue instead of resurfacing immediately.
+  let schedule = createNewFsrsCard();
+  let maturity = "new";
+  if (input.inheritFrom != null) {
+    const parent = await db.card.findUnique({ where: { id: input.inheritFrom } });
+    if (parent == null) {
+      throw new Error(`inheritFrom: card "${input.inheritFrom}" not found`);
+    }
+    schedule = {
+      due: parent.due,
+      stability: parent.stability,
+      difficulty: parent.difficulty,
+      reps: parent.reps,
+      lapses: parent.lapses,
+      state: parent.state,
+      lastReview: parent.lastReview,
+      interval: parent.interval,
+    };
+    maturity = parent.maturity;
+  }
 
   let duplicateWarning: DuplicateCheckResult | undefined;
 
@@ -106,14 +135,15 @@ export async function createCard(input: CreateCardInput): Promise<CreateCardResu
       type: input.type ?? "guided",
       category: input.category ?? null,
       source: input.source ?? null,
-      due: fsrsDefaults.due,
-      stability: fsrsDefaults.stability,
-      difficulty: fsrsDefaults.difficulty,
-      reps: fsrsDefaults.reps,
-      lapses: fsrsDefaults.lapses,
-      state: fsrsDefaults.state,
-      lastReview: fsrsDefaults.lastReview,
-      interval: fsrsDefaults.interval,
+      maturity,
+      due: schedule.due,
+      stability: schedule.stability,
+      difficulty: schedule.difficulty,
+      reps: schedule.reps,
+      lapses: schedule.lapses,
+      state: schedule.state,
+      lastReview: schedule.lastReview,
+      interval: schedule.interval,
     },
   });
 
