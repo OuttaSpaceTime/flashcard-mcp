@@ -126,12 +126,23 @@ export async function getNextCard(
   return db.card.findUnique({ where: { id: item.cardId } });
 }
 
+export type ReviewSchedule = {
+  /** ISO timestamp the card is next due. */
+  due: string;
+  /** Scheduled interval in days (0 for intra-day learning steps). */
+  interval: number;
+  /** FSRS state of the card after the review. */
+  state: number;
+  /** True when the card resurfaces in under a day (a learning step). */
+  intraDay: boolean;
+};
+
 export async function submitReview(
   sessionId: string,
   cardId: string,
   rating: Grade,
   responseMs?: number
-): Promise<void> {
+): Promise<ReviewSchedule> {
   const db = getDb();
 
   const card = await db.card.findUnique({ where: { id: cardId } });
@@ -168,6 +179,10 @@ export async function submitReview(
     },
   });
 
+  // A card resurfacing in under a day is an intra-day learning step.
+  const intraDay =
+    result.card.due.getTime() - Date.now() < 24 * 60 * 60 * 1000;
+
   // Update session stats
   const state = sessions.get(sessionId);
   const isNewCard = card.state === State.New;
@@ -177,8 +192,6 @@ export async function submitReview(
     state.pointer += 1;
 
     // Re-queue intra-day learning steps so the card repeats this session
-    const intraDay =
-      result.card.due.getTime() - Date.now() < 24 * 60 * 60 * 1000;
     if (intraDay) {
       state.queue.push({ cardId, reason: "learning_repeat" });
     }
@@ -196,6 +209,13 @@ export async function submitReview(
       ...(isNewCard ? { newCards: { increment: 1 } } : {}),
     },
   });
+
+  return {
+    due: result.card.due.toISOString(),
+    interval: result.card.interval,
+    state: result.card.state,
+    intraDay,
+  };
 }
 
 export function skipCard(sessionId: string): boolean {
