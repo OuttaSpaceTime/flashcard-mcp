@@ -125,13 +125,36 @@ function toReviewResult(item: RecordLogItem): ReviewResult {
   };
 }
 
+/**
+ * A non-New card must have a positive, finite stability. If it doesn't
+ * (stability 0/negative/NaN — a corruption that ts-fsrs's forgetting curve
+ * turns into NaN intervals and an Invalid Date `due`), the card was never
+ * properly learned. Recover by re-initializing it as a New card so this
+ * review acts as the first learning step.
+ */
+function sanitizeForReview(prismaCard: SchedulableCard): SchedulableCard {
+  const stabilityValid =
+    Number.isFinite(prismaCard.stability) && prismaCard.stability > 0;
+  if (prismaCard.state !== State.New && !stabilityValid) {
+    return {
+      ...prismaCard,
+      stability: 0,
+      difficulty: 0,
+      state: State.New,
+      lastReview: null,
+      interval: 0,
+    };
+  }
+  return prismaCard;
+}
+
 export function reviewCard(
   prismaCard: SchedulableCard,
   rating: Grade,
   now?: Date
 ): ReviewResult {
   const f = getScheduler();
-  const fsrsCard = toFsrsCard(prismaCard);
+  const fsrsCard = toFsrsCard(sanitizeForReview(prismaCard));
   const item = f.next(fsrsCard, now ?? new Date(), rating);
   return toReviewResult(item);
 }

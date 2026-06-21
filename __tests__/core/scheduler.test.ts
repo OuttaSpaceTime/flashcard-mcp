@@ -63,6 +63,30 @@ describe("scheduler", () => {
       expect(result.card.state).toBe(State.Relearning);
     });
 
+    it("recovers a corrupt Review-state card with zero stability instead of producing NaN", () => {
+      const now = new Date("2026-06-10T05:32:00.000Z");
+      const lastReview = new Date("2026-06-03T04:00:00.000Z");
+      const corrupt = {
+        due: new Date("2026-06-10T04:00:00.000Z"),
+        stability: 0, // invalid: a Review-state card should never have zero stability
+        difficulty: 1,
+        reps: 1,
+        lapses: 0,
+        state: State.Review as number,
+        lastReview,
+        interval: 7,
+      };
+
+      const result = reviewCard(corrupt, Rating.Good, now);
+
+      expect(Number.isFinite(result.card.stability)).toBe(true);
+      expect(result.card.stability).toBeGreaterThan(0);
+      expect(Number.isFinite(result.card.interval)).toBe(true);
+      expect(result.card.due).toBeInstanceOf(Date);
+      expect(Number.isNaN(result.card.due.getTime())).toBe(false);
+      expect(result.card.due.getTime()).toBeGreaterThan(now.getTime());
+    });
+
     it("does not modify the input prismaCard fields object", () => {
       const prismaCard = {
         due: new Date(),
