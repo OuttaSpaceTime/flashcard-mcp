@@ -19,6 +19,8 @@ interface SessionState {
   queue: SessionQueueItem[];
   pointer: number;
   goodCount: number;
+  /** Category filter the session was started with, for new-card top-ups. */
+  category?: string;
 }
 
 const sessions = new Map<string, SessionState>();
@@ -105,7 +107,12 @@ export async function startSession(
   const queue = [...unguidedQueue, ...reviewQueue, ...guidedNewQueue];
   const session = await db.studySession.create({ data: {} });
 
-  sessions.set(session.id, { queue, pointer: 0, goodCount: 0 });
+  sessions.set(session.id, {
+    queue,
+    pointer: 0,
+    goodCount: 0,
+    category: categoryFilter,
+  });
 
   return { id: session.id, queue };
 }
@@ -116,14 +123,45 @@ export async function getNextCard(
   const state = sessions.get(sessionId);
   if (!state) return null;
 
-  if (state.pointer >= state.queue.length) {
-    sessions.delete(sessionId);
-    return null;
+  const db = getDb();
+
+  // Skip over queue items whose card no longer exists (e.g. deleted
+  // mid-session). Without this, a deleted card at the pointer makes
+  // findUnique return null, ending the session and stranding the
+  // cards queued behind it. For each deleted card, pull in one
+  // replacement new card so the session keeps its intended size.
+  while (state.pointer < state.queue.length) {
+    const item = state.queue[state.pointer];
+    const card = await db.card.findUnique({ where: { id: item.cardId } });
+    if (card) return card;
+    state.pointer += 1;
+    await topUpNewCard(state);
   }
 
+  sessions.delete(sessionId);
+  return null;
+}
+
+/**
+ * Append one fresh new card to a session's queue, replacing a card that was
+ * deleted mid-session. Picks the oldest unqueued New card, respecting the
+ * session's category filter; does nothing when none is available.
+ */
+async function topUpNewCard(state: SessionState): Promise<void> {
   const db = getDb();
-  const item = state.queue[state.pointer];
-  return db.card.findUnique({ where: { id: item.cardId } });
+  const queuedIds = state.queue.map((item) => item.cardId);
+  const replacement = await db.card.findFirst({
+    where: {
+      state: State.New,
+      suspended: false,
+      id: { notIn: queuedIds },
+      ...(state.category !== undefined ? { category: state.category } : {}),
+    },
+    orderBy: { createdAt: "asc" },
+  });
+  if (replacement) {
+    state.queue.push({ cardId: replacement.id, reason: "new_card" });
+  }
 }
 
 export type ReviewSchedule = {

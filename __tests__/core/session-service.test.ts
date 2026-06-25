@@ -6,7 +6,7 @@ import {
   adjustSession,
   skipCard,
 } from "../../src/core/session-service.js";
-import { createCard } from "../../src/core/card-service.js";
+import { createCard, deleteCard } from "../../src/core/card-service.js";
 import { createDeck } from "../../src/core/deck-service.js";
 import { getDb } from "../../src/db/client.js";
 import { Rating, State } from "ts-fsrs";
@@ -159,6 +159,64 @@ describe("session-service", () => {
       expect(card).not.toBeNull();
       expect(card!.front).toBeDefined();
       expect(card!.back).toBeDefined();
+    });
+
+    it("skips a card deleted mid-session and serves the next one", async () => {
+      await seedCards(3);
+      const session = await startSession();
+
+      const card1 = await getNextCard(session.id);
+      expect(card1).not.toBeNull();
+
+      // Delete the in-progress card without rating or skipping it first.
+      await deleteCard(card1!.id);
+
+      // The session must not collapse: the remaining cards are still served.
+      const card2 = await getNextCard(session.id);
+      expect(card2).not.toBeNull();
+      expect(card2!.id).not.toBe(card1!.id);
+    });
+
+    it("pulls in a replacement new card when one is deleted mid-session", async () => {
+      const db = getDb();
+      await seedCards(6); // one more than the default new-card cap of 5
+      const session = await startSession({ maxNewCardsPerSession: 5 });
+      expect(session.queue.length).toBe(5);
+
+      const heldBackId = (await db.card.findMany()).find(
+        (c) => !session.queue.some((item) => item.cardId === c.id)
+      )!.id;
+
+      const card1 = await getNextCard(session.id);
+      await deleteCard(card1!.id);
+
+      // Drain the session, collecting every card it serves.
+      const served: string[] = [];
+      let next = await getNextCard(session.id);
+      while (next) {
+        served.push(next.id);
+        await submitReview(session.id, next.id, Rating.Easy);
+        next = await getNextCard(session.id);
+      }
+
+      expect(served).toContain(heldBackId); // replacement was pulled in
+      expect(served).not.toContain(card1!.id); // deleted card never served
+      // 4 survivors of the original queue + 1 topped-up replacement.
+      expect(new Set(served).size).toBe(5);
+    });
+
+    it("ends the session when every remaining card was deleted", async () => {
+      await seedCards(2);
+      const session = await startSession();
+
+      const card1 = await getNextCard(session.id);
+      const card2id = (await getDb().card.findMany()).find(
+        (c) => c.id !== card1!.id
+      )!.id;
+      await deleteCard(card1!.id);
+      await deleteCard(card2id);
+
+      expect(await getNextCard(session.id)).toBeNull();
     });
 
     it("returns null when queue is exhausted", async () => {
