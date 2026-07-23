@@ -208,7 +208,7 @@ server.registerTool(
   "create_card",
   {
     description:
-      "Create a new flashcard. Returns card and duplicate warnings. When splitting or deriving a card from an existing one, pass inheritFrom with the source card's id so the new card keeps the parent's FSRS schedule (due, stability, interval, state) instead of resetting to a fresh New card.",
+      "Create a new flashcard. Returns card and duplicate warnings. When splitting or deriving a card from an existing one, pass inheritFrom with the source card's id so the new card keeps the parent's FSRS schedule (due, stability, interval, state) instead of resetting to a fresh New card. Creation is blocked with an error once 50 or more cards are due (clear the review backlog first); splits via inheritFrom are exempt.",
     inputSchema: {
       deckId: z.string(),
       front: z.string(),

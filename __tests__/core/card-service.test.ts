@@ -9,6 +9,7 @@ import {
   unsuspendCard,
   searchCards,
   listCards,
+  DUE_LIMIT,
 } from "../../src/core/card-service.js";
 import { createDeck } from "../../src/core/deck-service.js";
 import { getDb } from "../../src/db/client.js";
@@ -155,6 +156,34 @@ describe("card-service", () => {
 
       // Card is still created (warning only, not blocked)
       expect(result.card.id).toBeDefined();
+    });
+  });
+
+  describe("createCard due limit", () => {
+    async function seedDue(n: number) {
+      const db = getDb();
+      for (let i = 0; i < n; i++) {
+        await db.card.create({ data: { deckId: testDeckId, front: `seed ${i}`, back: "a" } });
+      }
+    }
+
+    it("blocks creation when due count is at the limit", async () => {
+      await seedDue(DUE_LIMIT);
+      await expect(
+        createCard({ deckId: testDeckId, front: "one more", back: "a" })
+      ).rejects.toThrow(/due/i);
+    });
+
+    it("allows splits (inheritFrom) past the limit", async () => {
+      await seedDue(DUE_LIMIT);
+      const parent = await getDb().card.findFirst();
+      const { card } = await createCard({
+        deckId: testDeckId,
+        front: "split",
+        back: "a",
+        inheritFrom: parent!.id,
+      });
+      expect(card.front).toBe("split");
     });
   });
 

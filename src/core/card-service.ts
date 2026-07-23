@@ -46,6 +46,8 @@ function applyCategoryFilter(where: Record<string, unknown>, cat: string | undef
   else if (cat != null && cat !== "") where.category = cat;
 }
 
+export const DUE_LIMIT = 50;
+
 export const CARD_STATE_BY_NAME: Record<string, number> = {
   new: 0,
   learning: 1,
@@ -69,6 +71,15 @@ function scheduleEmbeddingUpdate(cardId: string, front: string, back: string): v
 export async function createCard(input: CreateCardInput): Promise<CreateCardResult> {
   assertCardContent({ front: input.front, back: input.back });
   const db = getDb();
+
+  if (input.inheritFrom == null) {
+    const dueCount = await db.card.count({ where: { due: { lte: new Date() }, suspended: false } });
+    if (dueCount >= DUE_LIMIT) {
+      throw new Error(
+        `Card creation blocked: ${dueCount} cards are due (limit ${DUE_LIMIT}). Clear the review backlog before adding new cards.`
+      );
+    }
+  }
 
   // Scheduling block: fresh FSRS defaults, unless deriving from a parent card
   // (split) — then inherit the parent's learned schedule so the new card keeps
