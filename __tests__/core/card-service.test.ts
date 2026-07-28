@@ -13,6 +13,7 @@ import {
 } from "../../src/core/card-service.js";
 import { createDeck } from "../../src/core/deck-service.js";
 import { getDb } from "../../src/db/client.js";
+import { cardMaturity } from "../../src/core/scheduler.js";
 import { State } from "ts-fsrs";
 
 let testDeckId: string;
@@ -40,7 +41,7 @@ describe("card-service", () => {
       expect(card.difficulty).toBe(0);
       expect(card.reps).toBe(0);
       expect(card.lapses).toBe(0);
-      expect(card.maturity).toBe("new");
+      expect(cardMaturity(card)).toBe("new");
       expect(card.type).toBe("guided");
       expect(card.suspended).toBe(false);
     });
@@ -105,7 +106,6 @@ describe("card-service", () => {
           lapses: 3,
           state: State.Review,
           interval: 82,
-          maturity: "review",
           due,
           lastReview,
         },
@@ -124,7 +124,7 @@ describe("card-service", () => {
       expect(card.lapses).toBe(3);
       expect(card.state).toBe(State.Review);
       expect(card.interval).toBe(82);
-      expect(card.maturity).toBe("review");
+      expect(cardMaturity(card)).toBe("internalized");
       expect(card.due.getTime()).toBe(due.getTime());
       expect(card.lastReview!.getTime()).toBe(lastReview.getTime());
     });

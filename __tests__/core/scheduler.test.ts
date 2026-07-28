@@ -3,6 +3,7 @@ import {
   reviewCard,
   getRetrievability,
   createNewFsrsCard,
+  cardMaturity,
 } from "../../src/core/scheduler.js";
 import { Rating, State } from "ts-fsrs";
 
@@ -157,5 +158,39 @@ describe("scheduler", () => {
       const r = getRetrievability(prismaCard);
       expect(r).toBe(0);
     });
+  });
+});
+
+describe("cardMaturity", () => {
+  it("classifies an unseen card as new", () => {
+    expect(cardMaturity({ state: State.New, interval: 0 })).toBe("new");
+  });
+
+  it("classifies learning and relearning as learning", () => {
+    expect(cardMaturity({ state: State.Learning, interval: 0 })).toBe("learning");
+    expect(cardMaturity({ state: State.Relearning, interval: 0 })).toBe("learning");
+  });
+
+  it("classifies a review card under 21 days as familiar", () => {
+    expect(cardMaturity({ state: State.Review, interval: 20 })).toBe("familiar");
+  });
+
+  it("classifies a review card at 21 days as internalized", () => {
+    expect(cardMaturity({ state: State.Review, interval: 21 })).toBe("internalized");
+  });
+
+  it("classifies a long-interval review card as internalized", () => {
+    expect(cardMaturity({ state: State.Review, interval: 365 })).toBe("internalized");
+  });
+
+  it("ignores interval for a card that is not in review state", () => {
+    expect(cardMaturity({ state: State.Relearning, interval: 400 })).toBe("learning");
+  });
+
+  it("returns one of the four CardMaturity values for every state", () => {
+    const buckets = ["new", "learning", "familiar", "internalized"];
+    for (const state of [State.New, State.Learning, State.Review, State.Relearning]) {
+      expect(buckets).toContain(cardMaturity({ state, interval: 30 }));
+    }
   });
 });

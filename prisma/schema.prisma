@@ -23,7 +23,6 @@ model Card {
   tags       String    @default("")
   category   String?
   type       String    @default("guided")
-  maturity   String    @default("new")
   source     String?
   // FSRS scheduling
   due        DateTime  @default(now())
@@ -70,7 +69,6 @@ model StudySession {
   cardsReviewed  Int       @default(0)
   newCards       Int       @default(0)
   accuracy       Float     @default(0)
-  topicBreakdown String    @default("{}")
 
   @@index([startTime])
 }

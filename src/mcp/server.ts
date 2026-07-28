@@ -5,6 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { createClient, setDb, getDb } from "../db/client.js";
 import { listDecks, getDeckStats, deleteDeck } from "../core/deck-service.js";
+import { cardMaturity } from "../core/scheduler.js";
 import {
   createCard,
   getCard,
@@ -25,6 +26,7 @@ import {
   submitReview,
   skipCard,
   adjustSession,
+  endSession,
 } from "../core/session-service.js";
 import {
   getFullStats,
@@ -94,7 +96,7 @@ server.registerTool(
             front: card.front,
             back: card.back,
             type: card.type,
-            maturity: card.maturity,
+            maturity: cardMaturity(card),
             tags: card.tags,
             category: card.category,
             reps: card.reps,
@@ -140,6 +142,29 @@ server.registerTool(
   async (args) => {
     const skipped = skipCard(args.sessionId);
     return j({ skipped });
+  }
+);
+
+server.registerTool(
+  "end_session",
+  {
+    description:
+      "Close a study session. Call this when the session is over (after the summary) so the row stops counting as open. Reviews do not close a session on their own. Idempotent; returns null if the session id is unknown.",
+    inputSchema: {
+      sessionId: z.string(),
+    },
+  },
+  async (args) => {
+    const ended = await endSession(args.sessionId);
+    if (ended == null) return j(null);
+    return j({
+      id: ended.id,
+      startTime: ended.startTime.toISOString(),
+      endTime: ended.endTime?.toISOString() ?? null,
+      cardsReviewed: ended.cardsReviewed,
+      newCards: ended.newCards,
+      accuracy: ended.accuracy,
+    });
   }
 );
 
@@ -220,7 +245,7 @@ server.registerTool(
         .string()
         .optional()
         .describe(
-          "Source card id to inherit the FSRS scheduling block from (due, stability, difficulty, reps, lapses, state, lastReview, interval, maturity). Use when splitting a card so the new cards honour the original's stability."
+          "Source card id to inherit the FSRS scheduling block from (due, stability, difficulty, reps, lapses, state, lastReview, interval). Use when splitting a card so the new cards honour the original's stability."
         ),
     },
   },
@@ -269,7 +294,7 @@ server.registerTool(
       tags: card.tags,
       category: card.category,
       type: card.type,
-      maturity: card.maturity,
+      maturity: cardMaturity(card),
       state: card.state,
       reps: card.reps,
       lapses: card.lapses,
@@ -394,7 +419,7 @@ server.registerTool(
         back: trunc(c.back),
         tags: parseTags(c.tags),
         category: c.category,
-        maturity: c.maturity,
+        maturity: cardMaturity(c),
         lapses: c.lapses,
       })),
     });
@@ -434,7 +459,7 @@ server.registerTool(
         front: c.front,
         back: c.back,
         tags: c.tags,
-        maturity: c.maturity,
+        maturity: cardMaturity(c),
         state: c.state,
       }))
     );
@@ -463,7 +488,7 @@ server.registerTool(
         front: c.front.slice(0, 80),
         deck: c.deck.name,
         state: c.state,
-        maturity: c.maturity,
+        maturity: cardMaturity(c),
       })),
     });
   }

@@ -10,7 +10,7 @@ import {
   type SemanticOptions,
 } from "./embeddings.js";
 import { parseTags, serializeTags } from "./types.js";
-import type { CardMaturity, CardType, DuplicateCheckResult } from "./types.js";
+import type { CardType, DuplicateCheckResult } from "./types.js";
 import type { Card as PrismaCard } from "@prisma/client";
 
 interface CreateCardInput {
@@ -24,7 +24,7 @@ interface CreateCardInput {
   checkDuplicates?: boolean;
   /**
    * Card id to inherit the FSRS scheduling block from (due, stability,
-   * difficulty, reps, lapses, state, lastReview, interval, maturity). Used when
+   * difficulty, reps, lapses, state, lastReview, interval). Used when
    * splitting or otherwise deriving a card from an existing one, so the new card
    * keeps the parent's learned schedule instead of resetting to a fresh New card.
    */
@@ -85,7 +85,6 @@ export async function createCard(input: CreateCardInput): Promise<CreateCardResu
   // (split) — then inherit the parent's learned schedule so the new card keeps
   // its place in the queue instead of resurfacing immediately.
   let schedule = createNewFsrsCard();
-  let maturity = "new";
   if (input.inheritFrom != null) {
     const parent = await db.card.findUnique({ where: { id: input.inheritFrom } });
     if (parent == null) {
@@ -101,7 +100,6 @@ export async function createCard(input: CreateCardInput): Promise<CreateCardResu
       lastReview: parent.lastReview,
       interval: parent.interval,
     };
-    maturity = parent.maturity;
   }
 
   let duplicateWarning: DuplicateCheckResult | undefined;
@@ -146,7 +144,6 @@ export async function createCard(input: CreateCardInput): Promise<CreateCardResu
       type: input.type ?? "guided",
       category: input.category ?? null,
       source: input.source ?? null,
-      maturity,
       due: schedule.due,
       stability: schedule.stability,
       difficulty: schedule.difficulty,
@@ -303,7 +300,6 @@ export async function searchCards(
     tags?: string[];
     category?: string;
     state?: number;
-    maturity?: CardMaturity;
   }
 ): Promise<PrismaCard[]> {
   const db = getDb();
@@ -329,10 +325,6 @@ export async function searchCards(
 
   if (filters?.state !== undefined) {
     where.state = filters.state;
-  }
-
-  if (filters?.maturity != null) {
-    where.maturity = filters.maturity;
   }
 
   applyCategoryFilter(where, filters?.category);

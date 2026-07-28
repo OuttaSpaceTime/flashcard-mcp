@@ -21,8 +21,8 @@ function seed(path: string): void {
     `INSERT INTO Deck (id, name, description, createdAt) VALUES (?, ?, ?, ?)`,
   ).run("deck1", "TestDeck", "d", new Date("2026-01-01").getTime());
   db.prepare(
-    `INSERT INTO Card (id, deckId, front, back, tags, type, maturity, due, stability, difficulty, reps, lapses, state, interval, suspended, createdAt, updatedAt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO Card (id, deckId, front, back, tags, type, due, stability, difficulty, reps, lapses, state, interval, suspended, createdAt, updatedAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     "card1",
     "deck1",
@@ -30,7 +30,6 @@ function seed(path: string): void {
     "Answer with\ttab",
     "foo,bar",
     "guided",
-    "new",
     new Date("2026-02-01").getTime(),
     1.5,
     2.5,

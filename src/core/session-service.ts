@@ -34,6 +34,7 @@ export async function startSession(
   configOverrides?: Partial<MasterConfig> & { category?: string }
 ): Promise<StartSessionResult> {
   const db = getDb();
+  await discardEmptySessions();
 
   const { category, ...configOnly } = configOverrides ?? {};
   const categoryFilter = category != null && category !== "" ? category : undefined;
@@ -242,7 +243,6 @@ export async function submitReview(
     where: { id: sessionId },
     data: {
       cardsReviewed: { increment: 1 },
-      endTime: new Date(),
       accuracy,
       ...(isNewCard ? { newCards: { increment: 1 } } : {}),
     },
@@ -254,6 +254,42 @@ export async function submitReview(
     state: result.card.state,
     intraDay,
   };
+}
+
+/**
+ * Close a session. `endTime` means "this session was ended", nothing else —
+ * reviews no longer touch it, so a row with a null `endTime` is genuinely still
+ * open rather than merely idle.
+ *
+ * Idempotent: an already-closed session keeps its original `endTime`.
+ */
+export async function endSession(sessionId: string) {
+  const db = getDb();
+  const session = await db.studySession.findUnique({ where: { id: sessionId } });
+  if (session == null) return null;
+
+  sessions.delete(sessionId);
+  if (session.endTime != null) return session;
+
+  return db.studySession.update({
+    where: { id: sessionId },
+    data: { endTime: new Date() },
+  });
+}
+
+/**
+ * Discard sessions that were started but never reviewed anything. A row with no
+ * reviews carries no information, and these accumulate whenever a session is
+ * opened and walked away from.
+ *
+ * Sessions that did review cards are left alone even when still open: we do not
+ * know when they ended, and stamping them with the current time would invent a
+ * duration. A null `endTime` on a session with reviews is the true statement
+ * that it was never closed.
+ */
+async function discardEmptySessions(): Promise<void> {
+  const db = getDb();
+  await db.studySession.deleteMany({ where: { endTime: null, cardsReviewed: 0 } });
 }
 
 export function skipCard(sessionId: string): boolean {

@@ -1,7 +1,6 @@
 import { getDb } from "../db/client.js";
-import { getRetrievability, toSchedulableCard } from "./scheduler.js";
+import { cardMaturity, getRetrievability, toSchedulableCard } from "./scheduler.js";
 import { State } from "ts-fsrs";
-import type { CardMaturity } from "./types.js";
 
 export async function getStudyStreak(): Promise<number> {
   const db = getDb();
@@ -86,7 +85,7 @@ export async function getMaturityReport(): Promise<
 > {
   const db = getDb();
   const decks = await db.deck.findMany({
-    include: { cards: { select: { maturity: true } } },
+    include: { cards: { select: { state: true, interval: true } } },
   });
 
   return decks
@@ -94,8 +93,7 @@ export async function getMaturityReport(): Promise<
     .map((deck) => {
       const counts = { new: 0, learning: 0, familiar: 0, internalized: 0 };
       for (const card of deck.cards) {
-        const m = card.maturity as CardMaturity;
-        if (m in counts) counts[m]++;
+        counts[cardMaturity(card)]++;
       }
       return {
         deckId: deck.id,
