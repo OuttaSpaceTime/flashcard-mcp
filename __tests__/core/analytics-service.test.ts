@@ -93,32 +93,17 @@ describe("analytics-service", () => {
   });
 
   describe("getMaturityReport", () => {
-    it("reports maturity distribution per deck", async () => {
+    it("derives maturity from state and interval, not a stored field", async () => {
       const db = getDb();
       const deck = await db.deck.create({ data: { name: "React" } });
       await db.card.create({
-        data: {
-          deckId: deck.id,
-          front: "Q1",
-          back: "A1",
-          maturity: "new",
-        },
+        data: { deckId: deck.id, front: "Q1", back: "A1", state: 0, interval: 0 },
       });
       await db.card.create({
-        data: {
-          deckId: deck.id,
-          front: "Q2",
-          back: "A2",
-          maturity: "familiar",
-        },
+        data: { deckId: deck.id, front: "Q2", back: "A2", state: 2, interval: 10 },
       });
       await db.card.create({
-        data: {
-          deckId: deck.id,
-          front: "Q3",
-          back: "A3",
-          maturity: "internalized",
-        },
+        data: { deckId: deck.id, front: "Q3", back: "A3", state: 2, interval: 200 },
       });
 
       const report = await getMaturityReport();
@@ -128,6 +113,40 @@ describe("analytics-service", () => {
       expect(report[0].familiar).toBe(1);
       expect(report[0].internalized).toBe(1);
       expect(report[0].total).toBe(3);
+    });
+
+    it("counts a heavily reviewed card as internalized, not new", async () => {
+      const db = getDb();
+      const deck = await db.deck.create({ data: { name: "Security" } });
+      await db.card.create({
+        data: {
+          deckId: deck.id,
+          front: "Q",
+          back: "A",
+          state: 2,
+          interval: 300,
+          reps: 38,
+          stability: 2229,
+        },
+      });
+
+      const report = await getMaturityReport();
+      expect(report[0].internalized).toBe(1);
+      expect(report[0].new).toBe(0);
+    });
+
+    it("buckets always sum to the deck's card count", async () => {
+      const db = getDb();
+      const deck = await db.deck.create({ data: { name: "Mixed" } });
+      for (const [state, interval] of [[0, 0], [1, 0], [2, 5], [2, 90], [3, 0]]) {
+        await db.card.create({
+          data: { deckId: deck.id, front: `Q${state}${interval}`, back: "A", state, interval },
+        });
+      }
+
+      const [r] = await getMaturityReport();
+      expect(r.new + r.learning + r.familiar + r.internalized).toBe(r.total);
+      expect(r.total).toBe(5);
     });
   });
 

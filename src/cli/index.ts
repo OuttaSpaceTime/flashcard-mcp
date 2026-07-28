@@ -6,6 +6,7 @@ import { createDeck, listDecks, getDeckStats, getDeckByName, getOrCreateDeck } f
 import { parseTags } from "../core/types.js";
 import { createCard, searchCards, backfillEmbeddings, updateCard, CARD_STATE_BY_NAME } from "../core/card-service.js";
 import { initEmbeddings } from "../core/embeddings.js";
+import { cardMaturity } from "../core/scheduler.js";
 import {
   startSession,
   getNextCard,
@@ -195,7 +196,7 @@ cardsCmd
     for (const card of cards) {
       const state = stateLabels[card.state] ?? "?";
       const cat = card.category != null ? ` {${card.category}}` : "";
-      console.log(`  [${state}] ${card.front.slice(0, 60)} (${card.deck.name})${cat} - ${card.maturity}`);
+      console.log(`  [${state}] ${card.front.slice(0, 60)} (${card.deck.name})${cat} - ${cardMaturity(card)}`);
     }
     console.log();
   });

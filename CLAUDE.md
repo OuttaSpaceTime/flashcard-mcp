@@ -44,10 +44,12 @@ MCP (src/mcp/server.ts) ──┼── Core services (src/core/*) ── Prisma
 /study skill            ──┘
 ```
 
+**Maturity is derived, never stored.** The `Card.maturity` column still exists in `schema.prisma` but nothing reads or writes it. It was only set at creation and never updated on review, so it reported cards with 38 reps and 2229 days of stability as `new`; `getMaturityReport` then silently dropped any card whose value wasn't one of the four `CardMaturity` strings via `if (m in counts)`, making the buckets not sum to the card count. Call `cardMaturity(card)` at the point of display. The column can be dropped by removing it from `schema.prisma` and running `npx prisma db push`.
+
 **Core modules** (`src/core/`):
-- `scheduler.ts` — ts-fsrs wrapper. Pure functions, no DB. `reviewCard()` applies a rating, `getRetrievability()` returns recall probability. Uses `Grade` type from ts-fsrs (not `Rating` — `Grade` excludes the `Manual` variant).
+- `scheduler.ts` — ts-fsrs wrapper. Pure functions, no DB. `reviewCard()` applies a rating, `getRetrievability()` returns recall probability, `cardMaturity()` derives new/learning/familiar/internalized from `state` + `interval` (mature at `MATURE_INTERVAL_DAYS`, Anki's 21-day convention). Uses `Grade` type from ts-fsrs (not `Rating` — `Grade` excludes the `Manual` variant).
 - `card-service.ts` — Card CRUD, duplicate detection (Jaccard + semantic embeddings), `backfillEmbeddings()`, `findSimilar()`, `getDueCards()`.
-- `session-service.ts` — Study session lifecycle. Queues stored in-memory (module-level Maps). Anti-overload: caps new cards at 5, review at 15, reduces new cards when reviews > 10.
+- `session-service.ts` — Study session lifecycle. Queues stored in-memory (module-level Maps). Anti-overload: caps new cards at 5, review at 15, reduces new cards when reviews > 10. **`endTime` means "the session was ended" — `submitReview` does not touch it**, so a null `endTime` is a session that was never closed rather than one that is merely idle. Close with `endSession()` (idempotent; the `end_session` MCP tool). `startSession()` first discards sessions that reviewed nothing, since those carry no information; sessions that did review cards are left open rather than back-stamped, because inventing an end time would invent a duration.
 - `embeddings.ts` — Two-stage similarity: `jaccardSimilarity()` (always available) + `cosineSimilarity()` on 384-dim vectors from `@huggingface/transformers` (lazy-loaded, ~30s first call). `findSimilarCards()` accepts optional `SemanticOptions` for the embedding stage.
 - `anki-apkg.ts` — Import/export `.apkg` files with full scheduling. Handles `collection.anki21b` (zstd-compressed SQLite) via `fzstd`. Converts between Anki SM-2 fields and FSRS, and reads native FSRS data from card.data JSON when present.
 - `anki-io.ts` — Import/export Anki "Notes in Plain Text" (`.txt`) format. Tab-separated with `#header` directives.

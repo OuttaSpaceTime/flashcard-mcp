@@ -37,6 +37,7 @@ import {
   getSessionHistory,
 } from "../../src/core/analytics-service.js";
 import { Rating, State } from "ts-fsrs";
+import { cardMaturity } from "../../src/core/scheduler.js";
 
 let deckId: string;
 
@@ -125,7 +126,7 @@ describe("MCP server tools (integration)", () => {
       expect(card!.front).toBe("Q");
       expect(card!.back).toBe("A");
       expect(card!.state).toBe(State.New);
-      expect(card!.maturity).toBe("new");
+      expect(cardMaturity(card!)).toBe("new");
       expect(card!.suspended).toBe(false);
     });
 
@@ -407,7 +408,10 @@ describe("MCP server tools (integration)", () => {
         front: "Internalized Q",
         back: "Internalized A",
       });
-      await getDb().card.update({ where: { id: internalized.id }, data: { maturity: "internalized" } });
+      await getDb().card.update({
+        where: { id: internalized.id },
+        data: { state: State.Review, interval: 200 },
+      });
 
       const session = await startSession();
       // Both should appear (internalized is not excluded)

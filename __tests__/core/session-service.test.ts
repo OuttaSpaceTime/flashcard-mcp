@@ -5,6 +5,7 @@ import {
   submitReview,
   adjustSession,
   skipCard,
+  endSession,
 } from "../../src/core/session-service.js";
 import { createCard, deleteCard } from "../../src/core/card-service.js";
 import { createDeck } from "../../src/core/deck-service.js";
@@ -19,7 +20,6 @@ async function seedCards(
     state: number;
     due: Date;
     type: string;
-    maturity: string;
     stability: number;
     lastReview: Date;
   }> = {}
@@ -35,7 +35,6 @@ async function seedCards(
         state: overrides.state ?? State.New,
         due: overrides.due ?? new Date(),
         type: overrides.type ?? "guided",
-        maturity: overrides.maturity ?? "new",
         stability: overrides.stability ?? 0,
         lastReview: overrides.lastReview ?? null,
       },
@@ -297,7 +296,7 @@ describe("session-service", () => {
       expect(updated!.cardsReviewed).toBe(1);
     });
 
-    it("updates endTime and accuracy after each review", async () => {
+    it("updates accuracy after each review, leaving the session open", async () => {
       await seedCards(2);
       const session = await startSession();
       const db = getDb();
@@ -306,7 +305,7 @@ describe("session-service", () => {
       await submitReview(session.id, card1!.id, Rating.Good);
 
       const afterFirst = await db.studySession.findUnique({ where: { id: session.id } });
-      expect(afterFirst!.endTime).not.toBeNull();
+      expect(afterFirst!.endTime).toBeNull();
       expect(afterFirst!.accuracy).toBe(1.0); // 1 good / 1 total
 
       const card2 = await getNextCard(session.id);
@@ -508,6 +507,92 @@ describe("session-service", () => {
 
       const session = await startSession();
       expect(session.queue.length).toBe(3);
+    });
+  });
+  describe("session lifecycle", () => {
+    describe("submitReview", () => {
+      it("does not stamp endTime — a review is activity, not an ending", async () => {
+        await seedCards(1);
+        const session = await startSession();
+        const card = await getNextCard(session.id);
+        await submitReview(session.id, card!.id, Rating.Good);
+
+        const row = await getDb().studySession.findUnique({ where: { id: session.id } });
+        expect(row!.endTime).toBeNull();
+        expect(row!.cardsReviewed).toBe(1);
+      });
+    });
+
+    describe("endSession", () => {
+      it("stamps endTime and returns the finalized summary", async () => {
+        await seedCards(1);
+        const session = await startSession();
+        const card = await getNextCard(session.id);
+        await submitReview(session.id, card!.id, Rating.Good);
+
+        const ended = await endSession(session.id);
+        expect(ended!.endTime).not.toBeNull();
+        expect(ended!.cardsReviewed).toBe(1);
+        expect(ended!.accuracy).toBe(1);
+      });
+
+      it("returns null for an unknown session", async () => {
+        expect(await endSession("does-not-exist")).toBeNull();
+      });
+
+      it("is idempotent — a second call does not move endTime", async () => {
+        await seedCards(1);
+        const session = await startSession();
+        const first = await endSession(session.id);
+        const second = await endSession(session.id);
+        expect(second!.endTime!.getTime()).toBe(first!.endTime!.getTime());
+      });
+
+      it("stops the queue so no further card is served", async () => {
+        await seedCards(2);
+        const session = await startSession();
+        await endSession(session.id);
+        expect(await getNextCard(session.id)).toBeNull();
+      });
+    });
+
+    describe("startSession discards empty sessions", () => {
+      it("deletes an abandoned session that reviewed nothing", async () => {
+        await seedCards(1);
+        const abandoned = await startSession();
+
+        await startSession();
+
+        const row = await getDb().studySession.findUnique({ where: { id: abandoned.id } });
+        expect(row).toBeNull();
+      });
+
+      it("keeps an abandoned session that did review cards, still open", async () => {
+        await seedCards(2);
+        const abandoned = await startSession();
+        const card = await getNextCard(abandoned.id);
+        await submitReview(abandoned.id, card!.id, Rating.Good);
+
+        await startSession();
+
+        const row = await getDb().studySession.findUnique({ where: { id: abandoned.id } });
+        expect(row).not.toBeNull();
+        expect(row!.cardsReviewed).toBe(1);
+        expect(row!.endTime).toBeNull();
+      });
+
+      it("leaves an already-ended session alone", async () => {
+        await seedCards(1);
+        const done = await startSession();
+        const card = await getNextCard(done.id);
+        await submitReview(done.id, card!.id, Rating.Good);
+        const ended = await endSession(done.id);
+
+        await startSession();
+
+        const row = await getDb().studySession.findUnique({ where: { id: done.id } });
+        expect(row!.endTime!.getTime()).toBe(ended!.endTime!.getTime());
+      });
     });
   });
 });

@@ -7,6 +7,7 @@ import {
   type RecordLogItem,
   type FSRS,
 } from "ts-fsrs";
+import type { CardMaturity } from "./types.js";
 
 export type SchedulableCard = {
   due: Date;
@@ -31,6 +32,22 @@ export type ReviewResult = {
     review: Date;
   };
 };
+
+/** Days of interval at which a review card counts as mature (Anki's convention). */
+export const MATURE_INTERVAL_DAYS = 21;
+
+/**
+ * Derive a card's maturity from its schedule.
+ *
+ * Maturity is always computed, never stored: it is a function of `state` and
+ * `interval`, both of which every review updates. A persisted copy would only
+ * ever go stale — and did, reporting cards with hundreds of reps as "new".
+ */
+export function cardMaturity(card: { state: number; interval: number }): CardMaturity {
+  if (card.state === State.New) return "new";
+  if (card.state === State.Learning || card.state === State.Relearning) return "learning";
+  return card.interval >= MATURE_INTERVAL_DAYS ? "internalized" : "familiar";
+}
 
 let scheduler: FSRS | null = null;
 
