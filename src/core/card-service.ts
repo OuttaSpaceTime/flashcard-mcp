@@ -1,6 +1,7 @@
 import { getDb } from "../db/client.js";
 import { assertCardContent } from "./content-rules.js";
 import { assertCanCreateCard } from "./pressure.js";
+import { leechResolutionFor } from "./leeches.js";
 import { createNewFsrsCard } from "./scheduler.js";
 import {
   checkDuplicate,
@@ -97,7 +98,11 @@ export async function createCard(input: CreateCardInput): Promise<CreateCardResu
       stability: parent.stability,
       difficulty: parent.difficulty,
       reps: parent.reps,
-      lapses: parent.lapses,
+      // Splitting a flagged leech is one of the ways out of the block, so the
+      // derived card starts with a clean failure record — the parent's lapses
+      // were earned by wording this card no longer has. The flag columns are
+      // never copied at all.
+      lapses: parent.leechFlaggedAt != null ? 0 : parent.lapses,
       state: parent.state,
       lastReview: parent.lastReview,
       interval: parent.interval,
@@ -210,7 +215,10 @@ export async function updateCard(
 ): Promise<PrismaCard> {
   assertCardContent({ front: updates.front, back: updates.back });
   const db = getDb();
-  const updated = await db.card.update({ where: { id }, data: updates });
+  const updated = await db.card.update({
+    where: { id },
+    data: { ...updates, ...(await leechResolutionFor(id)) },
+  });
 
   if (updates.front !== undefined || updates.back !== undefined) {
     scheduleEmbeddingUpdate(id, updated.front, updated.back);

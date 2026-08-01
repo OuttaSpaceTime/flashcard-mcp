@@ -33,6 +33,8 @@ import {
   getSessionHistory,
 } from "../core/analytics-service.js";
 import { checkPressure } from "../core/pressure.js";
+import { checkCalibration } from "../core/calibration.js";
+import { deferLeech, leechPayload } from "../core/leeches.js";
 import type { Grade } from "ts-fsrs";
 
 const prisma = createClient();
@@ -85,26 +87,26 @@ server.registerTool(
 server.registerTool(
   "get_next_card",
   {
-    description: "Get the next card in the current study session.",
+    description:
+      "Get the next card in the current study session. A served card that has lapsed 5+ times comes back with a `leech` field ({lapses, mustResolve: true}) and stops the loop: the next call to this tool errors until that card is rewritten (update_card), split (create_card with inheritFrom, then delete_card), deleted, or kept as-is via resolve_leech.",
     inputSchema: { sessionId: z.string() },
   },
   async (args) => {
     const card = await getNextCard(args.sessionId);
-    return j(
-      card
-        ? {
-            id: card.id,
-            front: card.front,
-            back: card.back,
-            type: card.type,
-            maturity: cardMaturity(card),
-            tags: card.tags,
-            category: card.category,
-            reps: card.reps,
-            lapses: card.lapses,
-          }
-        : { done: true, message: "No more cards in queue" }
-    );
+    if (card == null) return j({ done: true, message: "No more cards in queue" });
+    const leech = leechPayload(card);
+    return j({
+      id: card.id,
+      front: card.front,
+      back: card.back,
+      type: card.type,
+      maturity: cardMaturity(card),
+      tags: card.tags,
+      category: card.category,
+      reps: card.reps,
+      lapses: card.lapses,
+      ...(leech ? { leech } : {}),
+    });
   }
 );
 
@@ -203,6 +205,15 @@ server.registerTool(
       "SRS pressure check: the single source of truth for due counts and the pressure verdict. Two axes: review backlog (due cards excluding state New) and cards added today. Returns verdict (ok|warn|pause), flashcardsDue, newAvailable (due new cards, visibility only, never pressure), newToday, reasons, thresholds, clearance, and per-deck stats. clearance covers the flashcards axis only, giving the reviews needed to drop below warn/pause; the cards-added-today axis has none, because reviewing cannot lower it and intake resets at the start of the next day. The verdict token is authoritative: pause blocks create_card (inheritFrom splits exempt). Do not derive counts from get_due_cards, which caps its preview at 30.",
   },
   async () => j(await checkPressure())
+);
+
+server.registerTool(
+  "check_calibration",
+  {
+    description:
+      "Study calibration check: is the session asking questions at the right difficulty? Returns true_retention over the last 30 days (Anki's true-retention convention: reviews with elapsedDays >= 1, first review per card per local day, rated >= 3), the rating mix, and a verdict — over-difficult (below 80%), calibrated (80-90%), under-difficult (above 90%), or low-signal. low-signal means the number is not trustworthy yet: fewer than 50 eligible reviews, or more than 80% of ratings are Good, which is a grading-discrimination problem rather than a difficulty one. `marginal` flags a retention within 2 points of a band edge — soften the difficulty levers, do not switch them off. This verdict drives question difficulty only; it must never loosen the rating rubric, since the ratings are what produce the number.",
+  },
+  async () => j(await checkCalibration())
 );
 
 server.registerTool(
@@ -318,7 +329,8 @@ server.registerTool(
 server.registerTool(
   "update_card",
   {
-    description: "Update a card's front, back, or tags.",
+    description:
+      "Update a card's front, back, or tags. Updating a card that get_next_card flagged as a leech also clears the flag and resets its lapse count to 0: those lapses were earned by the old wording, and the rewrite is the resolution. Cards with no flag keep their lapse count.",
     inputSchema: {
       cardId: z.string(),
       front: z.string().optional(),
@@ -349,6 +361,22 @@ server.registerTool(
       back: updated.back,
       tags: updated.tags,
     });
+  }
+);
+
+server.registerTool(
+  "resolve_leech",
+  {
+    description:
+      "Answer a leech flag raised by get_next_card. action \"defer\" keeps the card exactly as it is and lets the session continue; the card flags again the next time it lapses. The other ways out need no tool of their own: update_card rewrites it, create_card with inheritFrom plus delete_card splits it, delete_card drops it.",
+    inputSchema: {
+      cardId: z.string(),
+      action: z.enum(["defer"]).describe("defer: keep the card as-is until it fails again"),
+    },
+  },
+  async (args) => {
+    const card = await deferLeech(args.cardId);
+    return j({ cardId: card.id, deferredAtLapses: card.leechDeferredLapses });
   }
 );
 

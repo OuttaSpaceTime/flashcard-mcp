@@ -36,6 +36,13 @@ model Card {
   state      Int       @default(0)
   lastReview DateTime?
   interval   Float     @default(0)
+  // Leech enforcement (see src/core/leeches.ts)
+  // Stamped when the study loop serves this card at or over LEECH_LAPSES; a
+  // stamp that is not covered by leechDeferredLapses blocks the next card.
+  leechFlaggedAt      DateTime?
+  // The lapse count the developer chose to keep this card at. The block lifts
+  // until the card fails again (lapses > leechDeferredLapses).
+  leechDeferredLapses Int?
   // RAG
   embedding  String?
   // Metadata
