@@ -22,6 +22,7 @@ import { readFileSync, writeFileSync } from "fs";
 import { parseAnkiTxt, importTxtNotes, exportCardsToAnkiTxt } from "../core/anki-io.js";
 import { exportToApkg, importFromApkg, importApkgCards } from "../core/anki-apkg.js";
 import { dumpDatabase, restoreDatabase } from "../core/db-dump.js";
+import { checkCalibration } from "../core/calibration.js";
 
 function defaultDbPath(): string {
   const url = process.env["DATABASE_URL"] ?? "file:./prisma/master.db";
@@ -382,6 +383,16 @@ program
       }
       console.log();
     }
+  });
+
+// --- calibration ---
+program
+  .command("calibration")
+  .description("True retention over the last 30 days plus a difficulty verdict, as JSON")
+  .action(async () => {
+    // stdout is a machine interface here — the study repo parses it — so this
+    // command prints the report and nothing else.
+    console.log(JSON.stringify(await checkCalibration(), null, 2));
   });
 
 // --- topics ---
