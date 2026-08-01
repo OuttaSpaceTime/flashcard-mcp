@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Verify
 
 ```bash
-npm test                          # Run all 259 tests (vitest)
+npm test                          # Run all 308 tests (vitest)
 npx vitest run __tests__/core/scheduler.test.ts  # Run single test file
 npx vitest run -t "creates a card" # Run tests matching name pattern
 npm run typecheck                 # TypeScript strict mode check (must be clean)
@@ -30,7 +30,7 @@ Tests use isolated temp SQLite databases created per test suite in `__tests__/se
 ## Running
 
 ```bash
-npm run dev:cli -- <command>       # CLI: init, study, stats, decks, cards, topics, import, export, embeddings
+npm run dev:cli -- <command>       # CLI: init, study, stats, calibration, decks, cards, topics, import, export, embeddings
 npm run dev:mcp                    # MCP server (stdio transport, configured in .claude/settings.json)
 ```
 
@@ -54,10 +54,12 @@ MCP (src/mcp/server.ts) ──┼── Core services (src/core/*) ── Prisma
 - `anki-apkg.ts` — Import/export `.apkg` files with full scheduling. Handles `collection.anki21b` (zstd-compressed SQLite) via `fzstd`. Converts between Anki SM-2 fields and FSRS, and reads native FSRS data from card.data JSON when present.
 - `anki-io.ts` — Import/export Anki "Notes in Plain Text" (`.txt`) format. Tab-separated with `#header` directives.
 - `pressure.ts` — SRS pressure: two axes (review backlog excluding state-New cards, cards added today) with warn/pause thresholds. `checkPressure()` backs the `check_pressure` tool; `assertCanCreateCard()` gates `createCard` at pause (`inheritFrom` creates and `updateCard` are never gated). New cards are an optional pool, never backlog; the cards-added-today axis uses the local calendar day, unlike the UTC streak convention in analytics-service. Splits are excluded from intake via the `Card.inheritedFrom` column, set by `createCard` when `inheritFrom` is passed. `clearance` covers the flashcards axis only — reviewing cannot lower intake, only the next day resets it. Batch writers that check pressure once up front pass `skipPressureGate` so an import is refused atomically rather than aborting half-applied (see `importTxtNotes`). Two entry points by cost: the internal `checkPressureCore()` is two counts flat and backs the create gate, while `checkPressure()` adds `newAvailable` and the per-deck breakdown at 4 + 5N queries in deck count. Keep the gate on the core — it runs on every fresh card and reads none of the extras.
+- `calibration.ts` — Study calibration: true retention over a 30-day window (Anki's convention — `elapsedDays >= 1`, first review per card per **local** calendar day, rated >= 3) against an 80-90% band, with `low-signal` below 50 eligible reviews or above an 80% Good share, and `marginal` within 2 points of a band edge. Backs the `check_calibration` tool and the `calibration` CLI subcommand, which prints the report as JSON in snake_case — that shape is a wire format the study repo parses, so do not rename its fields. Reviews are windowed in JS, never in SQL: `Review.reviewedAt` mixes epoch-ms INTEGERs with ISO TEXT and SQLite sorts every integer before every string, so a `where` clause on it drops most of the history.
+- `leeches.ts` — Leech enforcement, in the same spirit as the pressure gate: `getNextCard` stamps `Card.leechFlaggedAt` on a served card with `LEECH_LAPSES` (5) or more lapses and refuses to serve another until the flag is answered — `update_card` (clears the flag and resets lapses to 0), a split via `create_card` with `inheritFrom` plus `delete_card`, a plain `delete_card`, or `deferLeech` behind the `resolve_leech` tool. A deferral records `Card.leechDeferredLapses` and flags again at the next failure. Suspended cards are never flagged, and `inheritFrom` copies neither the flag nor the lapse count off a flagged parent.
 - `analytics-service.ts` — `getFullStats()` aggregates streak, retention, maturity, lapses in parallel.
 - `types.ts` — Shared types, `parseTags()`/`serializeTags()` utilities.
 
-**MCP server** exposes 23 tools. Tool arguments are validated by `McpServer` against each tool's Zod `inputSchema`; handler throws auto-convert to `isError` results. **`.txt` import/export is CLI-only** — `import_anki_txt` and `export_anki_txt` are intentionally absent from the MCP server. `.apkg` import/export is also CLI-only (file I/O); the MCP server handles in-memory card operations only.
+**MCP server** exposes 25 tools. Tool arguments are validated by `McpServer` against each tool's Zod `inputSchema`; handler throws auto-convert to `isError` results. **`.txt` import/export is CLI-only** — `import_anki_txt` and `export_anki_txt` are intentionally absent from the MCP server. `.apkg` import/export is also CLI-only (file I/O); the MCP server handles in-memory card operations only.
 
 **Skills** (in `~/.claude/skills/`):
 - `/study` — Interactive review sessions. Claude evaluates answers and rates them.
