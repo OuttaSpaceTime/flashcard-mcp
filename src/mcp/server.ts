@@ -32,6 +32,7 @@ import {
   getFullStats,
   getSessionHistory,
 } from "../core/analytics-service.js";
+import { checkPressure } from "../core/pressure.js";
 import type { Grade } from "ts-fsrs";
 
 const prisma = createClient();
@@ -196,6 +197,15 @@ server.registerTool(
 );
 
 server.registerTool(
+  "check_pressure",
+  {
+    description:
+      "SRS pressure check: the single source of truth for due counts and the pressure verdict. Two axes: review backlog (due cards excluding state New) and cards added today. Returns verdict (ok|warn|pause), flashcardsDue, newAvailable (due new cards, visibility only, never pressure), newToday, reasons, thresholds, clearance, and per-deck stats. clearance covers the flashcards axis only, giving the reviews needed to drop below warn/pause; the cards-added-today axis has none, because reviewing cannot lower it and intake resets at the start of the next day. The verdict token is authoritative: pause blocks create_card (inheritFrom splits exempt). Do not derive counts from get_due_cards, which caps its preview at 30.",
+  },
+  async () => j(await checkPressure())
+);
+
+server.registerTool(
   "list_decks",
   { description: "List all decks with card counts and stats." },
   async () => {
@@ -233,7 +243,7 @@ server.registerTool(
   "create_card",
   {
     description:
-      "Create a new flashcard. Returns card and duplicate warnings. When splitting or deriving a card from an existing one, pass inheritFrom with the source card's id so the new card keeps the parent's FSRS schedule (due, stability, interval, state) instead of resetting to a fresh New card. Creation is blocked with an error once 50 or more cards are due (clear the review backlog first); splits via inheritFrom are exempt.",
+      "Create a new flashcard. Returns card and duplicate warnings. When splitting or deriving a card from an existing one, pass inheritFrom with the source card's id so the new card keeps the parent's FSRS schedule (due, stability, interval, state) instead of resetting to a fresh New card. Creation is blocked with an error while check_pressure reads pause (50+ reviews due, or 10+ cards added today); splits via inheritFrom are exempt.",
     inputSchema: {
       deckId: z.string(),
       front: z.string(),

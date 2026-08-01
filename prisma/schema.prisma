@@ -24,6 +24,9 @@ model Card {
   category   String?
   type       String    @default("guided")
   source     String?
+  // Parent card id when this row was created via createCard's inheritFrom
+  // (a split/derive). Marks it as deck maintenance, not new intake.
+  inheritedFrom String?
   // FSRS scheduling
   due        DateTime  @default(now())
   stability  Float     @default(0)

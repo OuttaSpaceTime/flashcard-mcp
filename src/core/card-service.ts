@@ -1,5 +1,6 @@
 import { getDb } from "../db/client.js";
 import { assertCardContent } from "./content-rules.js";
+import { assertCanCreateCard } from "./pressure.js";
 import { createNewFsrsCard } from "./scheduler.js";
 import {
   checkDuplicate,
@@ -29,6 +30,12 @@ interface CreateCardInput {
    * keeps the parent's learned schedule instead of resetting to a fresh New card.
    */
   inheritFrom?: string;
+  /**
+   * Skip the per-card SRS pressure gate. Only for batch writers that check
+   * pressure once up front for the whole batch (see importTxtNotes), so an
+   * import is refused atomically instead of aborting half-applied.
+   */
+  skipPressureGate?: boolean;
 }
 
 interface CreateCardResult {
@@ -45,8 +52,6 @@ function applyCategoryFilter(where: Record<string, unknown>, cat: string | undef
   else if (cat === "__any__") where.category = { not: null };
   else if (cat != null && cat !== "") where.category = cat;
 }
-
-export const DUE_LIMIT = 50;
 
 export const CARD_STATE_BY_NAME: Record<string, number> = {
   new: 0,
@@ -72,13 +77,10 @@ export async function createCard(input: CreateCardInput): Promise<CreateCardResu
   assertCardContent({ front: input.front, back: input.back });
   const db = getDb();
 
-  if (input.inheritFrom == null) {
-    const dueCount = await db.card.count({ where: { due: { lte: new Date() }, suspended: false } });
-    if (dueCount >= DUE_LIMIT) {
-      throw new Error(
-        `Card creation blocked: ${dueCount} cards are due (limit ${DUE_LIMIT}). Clear the review backlog before adding new cards.`
-      );
-    }
+  // Splits/derives (inheritFrom) are exempt: they inherit an existing schedule,
+  // so they are already-seen material being reshaped, not new load.
+  if (input.inheritFrom == null && input.skipPressureGate !== true) {
+    await assertCanCreateCard();
   }
 
   // Scheduling block: fresh FSRS defaults, unless deriving from a parent card
@@ -144,6 +146,7 @@ export async function createCard(input: CreateCardInput): Promise<CreateCardResu
       type: input.type ?? "guided",
       category: input.category ?? null,
       source: input.source ?? null,
+      inheritedFrom: input.inheritFrom ?? null,
       due: schedule.due,
       stability: schedule.stability,
       difficulty: schedule.difficulty,

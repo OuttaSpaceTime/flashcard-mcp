@@ -9,8 +9,8 @@ import {
   unsuspendCard,
   searchCards,
   listCards,
-  DUE_LIMIT,
 } from "../../src/core/card-service.js";
+import { PAUSE_FLASHCARDS } from "../../src/core/pressure.js";
 import { createDeck } from "../../src/core/deck-service.js";
 import { getDb } from "../../src/db/client.js";
 import { cardMaturity } from "../../src/core/scheduler.js";
@@ -159,23 +159,47 @@ describe("card-service", () => {
     });
   });
 
-  describe("createCard due limit", () => {
+  describe("createCard pressure gate", () => {
+    // Review-state cards: new-state cards are an optional pool, not backlog,
+    // so they never trigger the gate. createdAt is backdated so the seeds
+    // don't fire the cards-added-today axis instead.
     async function seedDue(n: number) {
       const db = getDb();
-      for (let i = 0; i < n; i++) {
-        await db.card.create({ data: { deckId: testDeckId, front: `seed ${i}`, back: "a" } });
-      }
+      await db.card.createMany({
+        data: Array.from({ length: n }, (_, i) => ({
+          deckId: testDeckId,
+          front: `seed ${i}`,
+          back: "a",
+          state: State.Review,
+          due: new Date(Date.now() - 60_000),
+          createdAt: new Date(Date.now() - 24 * 3600 * 1000),
+        })),
+      });
     }
 
-    it("blocks creation when due count is at the limit", async () => {
-      await seedDue(DUE_LIMIT);
+    it("blocks creation when the review backlog is at the pause threshold", async () => {
+      await seedDue(PAUSE_FLASHCARDS);
       await expect(
         createCard({ deckId: testDeckId, front: "one more", back: "a" })
       ).rejects.toThrow(/due/i);
     });
 
+    it("does not block on new-state cards alone", async () => {
+      const db = getDb();
+      await db.card.createMany({
+        data: Array.from({ length: PAUSE_FLASHCARDS }, (_, i) => ({
+          deckId: testDeckId,
+          front: `new seed ${i}`,
+          back: "a",
+          createdAt: new Date(Date.now() - 24 * 3600 * 1000),
+        })),
+      });
+      const { card } = await createCard({ deckId: testDeckId, front: "still fine", back: "a" });
+      expect(card.front).toBe("still fine");
+    });
+
     it("allows splits (inheritFrom) past the limit", async () => {
-      await seedDue(DUE_LIMIT);
+      await seedDue(PAUSE_FLASHCARDS);
       const parent = await getDb().card.findFirst();
       const { card } = await createCard({
         deckId: testDeckId,
