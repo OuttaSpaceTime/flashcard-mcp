@@ -5,7 +5,7 @@ A spaced-repetition flashcard system with an MCP server and CLI, built on TypeSc
 ## Features
 
 - **FSRS scheduling** — state-of-the-art spaced repetition via `ts-fsrs`
-- **MCP server** — 21 tools for sessions, cards, decks, stats, and duplicate detection over stdio
+- **MCP server** — 23 tools for sessions, cards, decks, stats, pressure, and duplicate detection over stdio
 - **CLI** — `init`, `decks`, `cards`, `categories`, `study`, `stats`, `topics`, `import`, `export`, `embeddings`, `db:dump`, `db:restore`
 - **Semantic duplicate detection** — two-stage Jaccard + cosine similarity on 384-dim embeddings
 - **Anki interop** — import/export `.apkg` (including zstd-compressed `collection.anki21b`) with full scheduling, plus plain-text `.txt`
@@ -65,9 +65,11 @@ Example Claude Code configuration:
 
 ### Tools exposed
 
-Sessions: `start_session`, `get_next_card`, `submit_review`, `skip_card`, `adjust_session`
+Sessions: `start_session`, `get_next_card`, `submit_review`, `skip_card`, `adjust_session`, `end_session`
 Cards: `create_card`, `get_card`, `update_card`, `delete_card`, `delete_cards`, `list_cards`, `search_cards`, `suspend_card`, `unsuspend_card`, `find_similar_cards`, `get_due_cards`
-Decks & stats: `list_decks`, `get_deck_stats`, `delete_deck`, `get_stats`, `get_session_history`
+Decks & stats: `list_decks`, `get_deck_stats`, `delete_deck`, `get_stats`, `check_pressure`, `get_session_history`
+
+`check_pressure` is the single source of truth for due counts and the SRS pressure verdict (`ok`/`warn`/`pause`) across two axes: review backlog (due cards excluding state New) and cards added today. `create_card` is blocked while it reads pause; `inheritFrom` splits and `update_card` are always allowed, and splits are excluded from the intake axis via the `Card.inheritedFrom` column. The reported `clearance` covers the flashcards axis only, since reviewing cannot lower intake — only the start of the next day resets it. `.txt` import checks pressure once up front, so it is either refused whole or runs to completion.
 
 File I/O tools (`.apkg` / `.txt` import + export, DB dump/restore) are intentionally CLI-only — the MCP server handles in-memory card operations only.
 
