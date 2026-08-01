@@ -7,7 +7,9 @@ import {
 } from "../../src/core/anki-io.js";
 import { createDeck } from "../../src/core/deck-service.js";
 import { createCard } from "../../src/core/card-service.js";
+import { PAUSE_FLASHCARDS, PAUSE_NEW_TODAY } from "../../src/core/pressure.js";
 import { getDb } from "../../src/db/client.js";
+import { State } from "ts-fsrs";
 
 let deckId: string;
 
@@ -265,6 +267,64 @@ describe("anki-io", () => {
       const db = getDb();
       const card = await db.card.findFirstOrThrow({ where: { deckId, front: "What is JSX?" } });
       expect(card.back).toBe("Old answer");
+    });
+
+    it("imports more notes than the intake threshold in one run", async () => {
+      const txt = Array.from({ length: PAUSE_NEW_TODAY + 5 }, (_, i) => `Q${i}\tA${i}`).join("\n");
+      const result = await importTxtNotes(parseAnkiTxt(txt), deckId, {});
+
+      expect(result.created).toBe(PAUSE_NEW_TODAY + 5);
+      expect(await getDb().card.count({ where: { deckId } })).toBe(PAUSE_NEW_TODAY + 5);
+    });
+
+    it("refuses atomically when intake is already at pause, writing nothing", async () => {
+      const db = getDb();
+      await db.card.createMany({
+        data: Array.from({ length: PAUSE_NEW_TODAY }, (_, i) => ({
+          deckId,
+          front: `today ${i}`,
+          back: "a",
+        })),
+      });
+
+      const notes = parseAnkiTxt("Q1\tA1\nQ2\tA2\nQ3\tA3");
+      await expect(importTxtNotes(notes, deckId, {})).rejects.toThrow(/cards added today/);
+
+      expect(await db.card.count({ where: { front: { startsWith: "Q" } } })).toBe(0);
+    });
+
+    it("refuses atomically when the review backlog is at pause, writing nothing", async () => {
+      const db = getDb();
+      await db.card.createMany({
+        data: Array.from({ length: PAUSE_FLASHCARDS }, (_, i) => ({
+          deckId,
+          front: `backlog ${i}`,
+          back: "a",
+          state: State.Review,
+          due: new Date(Date.now() - 60_000),
+          createdAt: new Date(Date.now() - 24 * 3600 * 1000),
+        })),
+      });
+
+      const notes = parseAnkiTxt("Q1\tA1\nQ2\tA2\nQ3\tA3");
+      await expect(importTxtNotes(notes, deckId, {})).rejects.toThrow(/Card creation blocked/);
+
+      expect(await db.card.count({ where: { front: { startsWith: "Q" } } })).toBe(0);
+    });
+
+    it("dry-run is refused at pause too, so it never promises an unreachable count", async () => {
+      await getDb().card.createMany({
+        data: Array.from({ length: PAUSE_NEW_TODAY }, (_, i) => ({
+          deckId,
+          front: `today ${i}`,
+          back: "a",
+        })),
+      });
+
+      const notes = parseAnkiTxt("Q1\tA1");
+      await expect(importTxtNotes(notes, deckId, { dryRun: true })).rejects.toThrow(
+        /Card creation blocked/
+      );
     });
   });
 
