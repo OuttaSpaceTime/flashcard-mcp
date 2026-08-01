@@ -292,6 +292,7 @@ export function exportToAnkiTxt(notes: AnkiNote[]): string {
 
 import { getDb } from "../db/client.js";
 import { createCard } from "./card-service.js";
+import { assertCanCreateCard } from "./pressure.js";
 import { parseTags, serializeTags } from "./types.js";
 
 export async function importTxtNotes(
@@ -301,6 +302,13 @@ export async function importTxtNotes(
 ): Promise<{ created: number; updated: number; duplicates: number; skipped: number }> {
   const { dryRun = false, conflict = "ours" } = opts;
   const db = getDb();
+
+  // An import is one deliberate act with all the material in hand, so pressure
+  // is checked once here and the per-card gate is skipped below. Gating each
+  // note would abort mid-loop and leave the import half-applied; dry runs check
+  // too, so they never promise a count a real run would refuse.
+  await assertCanCreateCard();
+
   let created = 0;
   let updated = 0;
   let duplicates = 0;
@@ -340,6 +348,7 @@ export async function importTxtNotes(
         front: note.front,
         back: note.back,
         tags: note.tags,
+        skipPressureGate: true,
       });
     }
     created++;
