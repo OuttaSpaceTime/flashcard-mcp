@@ -1,4 +1,5 @@
 import { getDb } from "../db/client.js";
+import { assertNoUnresolvedLeech, flagLeechOnServe } from "./leeches.js";
 import {
   reviewCard as scheduleReview,
   getRetrievability,
@@ -121,6 +122,11 @@ export async function startSession(
 export async function getNextCard(
   sessionId: string
 ): Promise<PrismaCard | null> {
+  // A leech flagged on the previous serve blocks the whole loop, not just this
+  // session: the card has to be rewritten, split, dropped, or explicitly kept
+  // before any more studying happens.
+  await assertNoUnresolvedLeech();
+
   const state = sessions.get(sessionId);
   if (!state) return null;
 
@@ -134,7 +140,7 @@ export async function getNextCard(
   while (state.pointer < state.queue.length) {
     const item = state.queue[state.pointer];
     const card = await db.card.findUnique({ where: { id: item.cardId } });
-    if (card) return card;
+    if (card) return flagLeechOnServe(card);
     state.pointer += 1;
     await topUpNewCard(state);
   }
