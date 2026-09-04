@@ -22,8 +22,8 @@ interface Rule {
 
 const RULES: Rule[] = [
   {
-    pattern: /—/,
-    message: "em dash (—) is forbidden, write two sentences instead",
+    pattern: /—|&mdash;|&#8212;|&#x2014;/i,
+    message: "em dash (—) is forbidden, write two sentences instead (the &mdash; entity counts, Anki renders it identically)",
   },
   {
     pattern: /`/,

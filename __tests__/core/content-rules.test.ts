@@ -28,6 +28,23 @@ describe("validateCardContent", () => {
     expect(violations[0]).toMatch(/two sentences/i);
   });
 
+  it("rejects the em dash entity, which Anki renders identically", () => {
+    const violations = validateCardContent("Tokens expire &mdash; revocation needs state.");
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toMatch(/em dash/i);
+    expect(violations[0]).toMatch(/two sentences/i);
+  });
+
+  it("rejects numeric and hex em dash references", () => {
+    expect(validateCardContent("a &#8212; b")[0]).toMatch(/em dash/i);
+    expect(validateCardContent("a &#x2014; b")[0]).toMatch(/em dash/i);
+  });
+
+  it("still allows en dashes, which are fine in numeric ranges", () => {
+    expect(validateCardContent("valid for 1\u20134 days")).toEqual([]);
+    expect(validateCardContent("valid for 1&ndash;4 days")).toEqual([]);
+  });
+
   it("rejects markdown backticks", () => {
     expect(validateCardContent("set `SameSite=Lax`")[0]).toMatch(/<code>/);
   });
