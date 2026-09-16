@@ -13,6 +13,7 @@ beforeEach(async () => {
   await db.studySession.deleteMany();
   await db.review.deleteMany();
   await db.card.deleteMany();
+  await db.deletedCard.deleteMany();
   await db.deck.deleteMany();
   await db.config.deleteMany();
 });

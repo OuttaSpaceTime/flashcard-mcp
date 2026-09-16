@@ -237,16 +237,27 @@ export async function unsuspendCard(id: string): Promise<PrismaCard> {
   return db.card.update({ where: { id }, data: { suspended: false } });
 }
 
+// A tombstone is written with every delete. anki-sync needs it to tell a card
+// deleted here from one created on another machine and not yet synced down:
+// both look like "no row" otherwise, and guessing either way destroys cards.
 export async function deleteCard(id: string): Promise<void> {
   const db = getDb();
-  await db.card.delete({ where: { id } });
+  await db.$transaction(async (tx) => {
+    await tx.deletedCard.upsert({ where: { cardId: id }, create: { cardId: id }, update: {} });
+    await tx.card.delete({ where: { id } });
+  });
 }
 
 export async function deleteCards(ids: string[]): Promise<{ deleted: number }> {
   if (ids.length === 0) return { deleted: 0 };
   const db = getDb();
-  const res = await db.card.deleteMany({ where: { id: { in: ids } } });
-  return { deleted: res.count };
+  return db.$transaction(async (tx) => {
+    for (const cardId of ids) {
+      await tx.deletedCard.upsert({ where: { cardId }, create: { cardId }, update: {} });
+    }
+    const res = await tx.card.deleteMany({ where: { id: { in: ids } } });
+    return { deleted: res.count };
+  });
 }
 
 export async function listCards(filters: {

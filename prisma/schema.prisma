@@ -113,3 +113,12 @@ model Config {
   requestRetention         Float   @default(0.9)
   practiceFirstMode        Boolean @default(true)
 }
+
+// Deletion has to be explicit state, not absence: several machines share one
+// AnkiWeb collection, and a card missing from this database is otherwise
+// indistinguishable from one created on another machine and not yet synced here.
+// anki-sync reads these to tell the two apart. Kept forever; a row is ~40 bytes.
+model DeletedCard {
+  cardId    String   @id
+  deletedAt DateTime @default(now())
+}
