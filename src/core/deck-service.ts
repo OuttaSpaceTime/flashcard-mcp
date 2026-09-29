@@ -73,7 +73,14 @@ export async function deleteDeck(deckId: string): Promise<{ deletedCards: number
     include: { _count: { select: { cards: true } } },
   });
   if (!deck) throw new Error(`Deck not found: ${deckId}`);
-  await db.deck.delete({ where: { id: deckId } });
+  // Tombstone every card the cascade is about to remove (see deleteCard).
+  await db.$transaction(async (tx) => {
+    const cards = await tx.card.findMany({ where: { deckId }, select: { id: true } });
+    for (const { id } of cards) {
+      await tx.deletedCard.upsert({ where: { cardId: id }, create: { cardId: id }, update: {} });
+    }
+    await tx.deck.delete({ where: { id: deckId } });
+  });
   return { deletedCards: deck._count.cards };
 }
 

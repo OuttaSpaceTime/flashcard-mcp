@@ -20,6 +20,12 @@ interface SessionState {
   queue: SessionQueueItem[];
   pointer: number;
   goodCount: number;
+  /**
+   * Queue slots passed over because their card was deleted before it was
+   * served. They never count as a position, so `getQueuePosition` subtracts
+   * them from both the position and the total.
+   */
+  dropped: number;
   /** Category filter the session was started with, for new-card top-ups. */
   category?: string;
 }
@@ -113,6 +119,7 @@ export async function startSession(
     queue,
     pointer: 0,
     goodCount: 0,
+    dropped: 0,
     category: categoryFilter,
   });
 
@@ -142,11 +149,38 @@ export async function getNextCard(
     const card = await db.card.findUnique({ where: { id: item.cardId } });
     if (card) return flagLeechOnServe(card);
     state.pointer += 1;
+    state.dropped += 1;
     await topUpNewCard(state);
   }
 
   sessions.delete(sessionId);
   return null;
+}
+
+export interface QueuePosition {
+  /** 1-based position of the card currently served. */
+  position: number;
+  /** Current session size: grows by one per intra-day re-queue. */
+  total: number;
+  /** True when the served card is an intra-day learning repeat. */
+  repeat: boolean;
+}
+
+/**
+ * Where the card most recently returned by `getNextCard` sits in the session.
+ * Re-queued learning repeats raise the total; a skipped card keeps its
+ * position; a deleted card's slot counts for neither (its top-up replacement
+ * takes its place, so the total only drops when no new card is left).
+ * Returns null for an unknown or exhausted session.
+ */
+export function getQueuePosition(sessionId: string): QueuePosition | null {
+  const state = sessions.get(sessionId);
+  if (!state || state.pointer >= state.queue.length) return null;
+  return {
+    position: state.pointer + 1 - state.dropped,
+    total: state.queue.length - state.dropped,
+    repeat: state.queue[state.pointer].reason === "learning_repeat",
+  };
 }
 
 /**

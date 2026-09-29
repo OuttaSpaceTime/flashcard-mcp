@@ -275,6 +275,20 @@ describe("card-service", () => {
       const found = await getCard(card.id);
       expect(found).toBeNull();
     });
+
+    it("leaves a tombstone so the Anki sync does not re-import the card", async () => {
+      const { card } = await createCard({ deckId: testDeckId, front: "Q", back: "A" });
+
+      await deleteCard(card.id);
+
+      const tomb = await getDb().deletedCard.findUnique({ where: { cardId: card.id } });
+      expect(tomb).not.toBeNull();
+    });
+
+    it("writes no tombstone when the card does not exist", async () => {
+      await expect(deleteCard("nonexistent-id")).rejects.toThrow();
+      expect(await getDb().deletedCard.count()).toBe(0);
+    });
   });
 
   describe("suspendCard / unsuspendCard", () => {
@@ -582,6 +596,9 @@ describe("card-service", () => {
       });
       const res = await deleteCards([card.id, "nonexistent-id"]);
       expect(res.deleted).toBe(1);
+
+      const tombs = await getDb().deletedCard.findMany();
+      expect(tombs.map((t) => t.cardId)).toEqual([card.id]);
     });
   });
 });

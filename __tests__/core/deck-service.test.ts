@@ -169,6 +169,18 @@ describe("deck-service", () => {
       expect(await db.card.count({ where: { deckId: deck.id } })).toBe(0);
     });
 
+    it("tombstones every card it cascades away", async () => {
+      const deck = await createDeck("React");
+      const db = getDb();
+      const a = await db.card.create({ data: { deckId: deck.id, front: "Q1", back: "A1" } });
+      const b = await db.card.create({ data: { deckId: deck.id, front: "Q2", back: "A2" } });
+
+      await deleteDeck(deck.id);
+
+      const tombs = await db.deletedCard.findMany({ orderBy: { cardId: "asc" } });
+      expect(tombs.map((t) => t.cardId)).toEqual([a.id, b.id].sort());
+    });
+
     it("throws when deck does not exist", async () => {
       await expect(deleteDeck("nonexistent-id")).rejects.toThrow("Deck not found: nonexistent-id");
     });

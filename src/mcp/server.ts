@@ -23,6 +23,7 @@ import { parseTags } from "../core/types.js";
 import {
   startSession,
   getNextCard,
+  getQueuePosition,
   submitReview,
   skipCard,
   adjustSession,
@@ -88,14 +89,16 @@ server.registerTool(
   "get_next_card",
   {
     description:
-      "Get the next card in the current study session. A served card that has lapsed 5+ times comes back with a `leech` field ({lapses, mustResolve: true}) and stops the loop: the next call to this tool errors until that card is rewritten (update_card), split (create_card with inheritFrom, then delete_card), deleted, or kept as-is via resolve_leech.",
+      "Get the next card in the current study session. Includes `position` (1-based) and `total` (current session size) for a `Card position/total` line; `total` grows by one whenever submit_review returns intraDay: true, since that card is re-queued at the end. `repeat: true` marks a re-served intra-day learning repeat. A served card that has lapsed 5+ times comes back with a `leech` field ({lapses, mustResolve: true}) and stops the loop: the next call to this tool errors until that card is rewritten (update_card), split (create_card with inheritFrom, then delete_card), deleted, or kept as-is via resolve_leech.",
     inputSchema: { sessionId: z.string() },
   },
   async (args) => {
     const card = await getNextCard(args.sessionId);
     if (card == null) return j({ done: true, message: "No more cards in queue" });
     const leech = leechPayload(card);
+    const queuePosition = getQueuePosition(args.sessionId);
     return j({
+      ...(queuePosition ?? {}),
       id: card.id,
       front: card.front,
       back: card.back,
@@ -241,7 +244,7 @@ server.registerTool(
   "delete_deck",
   {
     description:
-      "Permanently delete a deck and all its cards and review history. Irreversible.",
+      "Permanently delete a deck and all its cards and review history. Irreversible. Each card leaves a tombstone so the deletion propagates through Anki sync.",
     inputSchema: { deckId: z.string() },
   },
   async (args) => {
@@ -383,7 +386,8 @@ server.registerTool(
 server.registerTool(
   "delete_card",
   {
-    description: "Permanently delete a card and all its review history.",
+    description:
+      "Permanently delete a card and all its review history. Leaves a tombstone so the deletion propagates through Anki sync instead of the card being re-imported.",
     inputSchema: { cardId: z.string() },
   },
   async (args) => {
@@ -468,7 +472,7 @@ server.registerTool(
   "delete_cards",
   {
     description:
-      "Permanently delete multiple cards by ID. Returns count of cards deleted. Irreversible.",
+      "Permanently delete multiple cards by ID. Returns count of cards deleted. Irreversible. Each deleted card leaves a tombstone so the deletion propagates through Anki sync.",
     inputSchema: { cardIds: z.array(z.string()) },
   },
   async (args) => j(await deleteCards(args.cardIds))

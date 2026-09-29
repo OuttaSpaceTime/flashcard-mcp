@@ -252,10 +252,11 @@ export async function deleteCards(ids: string[]): Promise<{ deleted: number }> {
   if (ids.length === 0) return { deleted: 0 };
   const db = getDb();
   return db.$transaction(async (tx) => {
-    for (const cardId of ids) {
-      await tx.deletedCard.upsert({ where: { cardId }, create: { cardId }, update: {} });
+    const existing = await tx.card.findMany({ where: { id: { in: ids } }, select: { id: true } });
+    for (const { id } of existing) {
+      await tx.deletedCard.upsert({ where: { cardId: id }, create: { cardId: id }, update: {} });
     }
-    const res = await tx.card.deleteMany({ where: { id: { in: ids } } });
+    const res = await tx.card.deleteMany({ where: { id: { in: existing.map((c) => c.id) } } });
     return { deleted: res.count };
   });
 }

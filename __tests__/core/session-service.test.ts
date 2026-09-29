@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import {
   startSession,
   getNextCard,
+  getQueuePosition,
   submitReview,
   adjustSession,
   skipCard,
@@ -455,6 +456,97 @@ describe("session-service", () => {
       expect(queue).toEqual([
         { cardId: card!.id, reason: "learning_repeat" },
       ]);
+    });
+  });
+
+  describe("getQueuePosition", () => {
+    function seedReviewCards(count: number) {
+      return seedCards(count, {
+        state: State.Review,
+        due: new Date(Date.now() - 24 * 60 * 60 * 1000),
+        stability: 5,
+        lastReview: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),
+      });
+    }
+
+    it("reports a plain serve's 1-based position and the queue length", async () => {
+      await seedReviewCards(3);
+      const session = await startSession();
+
+      await getNextCard(session.id);
+      expect(getQueuePosition(session.id)).toEqual({ position: 1, total: 3, repeat: false });
+
+      const card = await getNextCard(session.id);
+      expect(getQueuePosition(session.id)).toEqual({ position: 1, total: 3, repeat: false });
+
+      await submitReview(session.id, card!.id, Rating.Good);
+      await getNextCard(session.id);
+      expect(getQueuePosition(session.id)).toEqual({ position: 2, total: 3, repeat: false });
+    });
+
+    it("raises the total by one on the serve after an Again re-queues", async () => {
+      await seedReviewCards(3);
+      const session = await startSession();
+
+      const card = await getNextCard(session.id);
+      const schedule = await submitReview(session.id, card!.id, Rating.Again);
+      expect(schedule.intraDay).toBe(true);
+
+      await getNextCard(session.id);
+      expect(getQueuePosition(session.id)).toEqual({ position: 2, total: 4, repeat: false });
+    });
+
+    it("flags the re-served learning repeat", async () => {
+      await seedReviewCards(2);
+      const session = await startSession();
+
+      const first = await getNextCard(session.id);
+      await submitReview(session.id, first!.id, Rating.Again);
+      const second = await getNextCard(session.id);
+      await submitReview(session.id, second!.id, Rating.Good);
+
+      const repeat = await getNextCard(session.id);
+      expect(repeat!.id).toBe(first!.id);
+      expect(getQueuePosition(session.id)).toEqual({ position: 3, total: 3, repeat: true });
+    });
+
+    it("counts a skipped card as a position without changing the total", async () => {
+      await seedReviewCards(3);
+      const session = await startSession();
+
+      await getNextCard(session.id);
+      skipCard(session.id);
+      await getNextCard(session.id);
+      expect(getQueuePosition(session.id)).toEqual({ position: 2, total: 3, repeat: false });
+    });
+
+    it("keeps position and total steady when a deleted card is topped up", async () => {
+      await seedReviewCards(3);
+      const session = await startSession({ maxNewCardsPerSession: 0 });
+      await seedCards(1); // unqueued new card, available as the top-up
+
+      const card1 = await getNextCard(session.id);
+      await submitReview(session.id, card1!.id, Rating.Good);
+      await deleteCard(session.queue[1].cardId);
+
+      await getNextCard(session.id);
+      expect(getQueuePosition(session.id)).toEqual({ position: 2, total: 3, repeat: false });
+    });
+
+    it("drops the total by one when a deleted card has no replacement", async () => {
+      await seedReviewCards(3);
+      const session = await startSession();
+
+      const card1 = await getNextCard(session.id);
+      await submitReview(session.id, card1!.id, Rating.Good);
+      await deleteCard(session.queue[1].cardId);
+
+      await getNextCard(session.id);
+      expect(getQueuePosition(session.id)).toEqual({ position: 2, total: 2, repeat: false });
+    });
+
+    it("returns null for an unknown session", () => {
+      expect(getQueuePosition("nope")).toBeNull();
     });
   });
 
