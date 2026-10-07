@@ -60,11 +60,12 @@ function j(data: unknown) {
 server.registerTool(
   "start_session",
   {
-    description: "Start a study session. Returns session ID and card queue info.",
+    description:
+      "Start a study session. Returns sessionId, queueLength and queue (items of {cardId, reason}). The queue holds due review cards, lowest recall probability first, up to maxReviewCards, followed by up to maxNewCards New cards (at most 3 when more than 10 reviews are queued); with practiceFirst, unguided New cards move to the front. It does not consult check_pressure. Starting a session deletes every open session that has no reviews yet, so their session ids stop working.",
     inputSchema: {
       maxNewCards: z.number().optional().describe("Max new cards (default 5)"),
       maxReviewCards: z.number().optional().describe("Max review cards (default 15)"),
-      practiceFirst: z.boolean().optional().describe("Prioritize unguided/exercise cards"),
+      practiceFirst: z.boolean().optional().describe("Prioritize unguided/exercise cards (default true)"),
       category: z
         .string()
         .optional()
@@ -143,7 +144,7 @@ server.registerTool(
   "skip_card",
   {
     description:
-      "Skip the current card without reviewing it. Advances to the next card in the queue.",
+      "Skip the current card without reviewing it. Advances to the next card in the queue; no review is recorded, the card's schedule is unchanged, and it does not come back this session. Returns skipped: false for an unknown or ended session.",
     inputSchema: { sessionId: z.string() },
   },
   async (args) => {
@@ -178,11 +179,15 @@ server.registerTool(
 server.registerTool(
   "adjust_session",
   {
-    description: "Adjust current session: change card count or focus deck.",
+    description:
+      "Narrow the rest of a session's queue, from the current card on. maxCards keeps only the next N cards; focusDeck and focusCategory drop the cards outside that deck or category (applied after maxCards). It never adds cards and leaves reviewed or skipped cards alone. Returns remainingCards and the remaining queue; an unknown or ended session returns an empty queue instead of an error.",
     inputSchema: {
       sessionId: z.string(),
-      maxCards: z.number().optional(),
-      focusDeck: z.string().optional(),
+      maxCards: z.number().optional().describe("Keep at most this many cards, counting from the current one"),
+      focusDeck: z
+        .string()
+        .optional()
+        .describe("Deck id from list_decks, not the deck name: a name matches no card and empties the rest of the session"),
       focusCategory: z.string().optional().describe("Narrow queue to this category"),
     },
   },
@@ -198,7 +203,10 @@ server.registerTool(
 
 server.registerTool(
   "get_stats",
-  { description: "Get study statistics: streak, retention, maturity, lapse patterns." },
+  {
+    description:
+      "Get study statistics: streak (consecutive local days with reviews, ending today), per-deck retention, per-deck maturity counts, the 20 cards with the most lapses, and the 5 most recent sessions. Retention here is each deck's average predicted recall probability (FSRS retrievability) right now, not measured accuracy; check_calibration reports the measured true retention and the difficulty verdict.",
+  },
   async () => j(await getFullStats())
 );
 
@@ -235,7 +243,8 @@ server.registerTool(
 server.registerTool(
   "get_deck_stats",
   {
-    description: "Get detailed stats for a specific deck.",
+    description:
+      "Get one deck's card counts: totalCards, cards per FSRS state (newCards, learningCards, reviewCards, relearningCards), and unsuspended cards due now, in total (dueCards, New cards included) and per state (dueNew, dueLearning, dueReview, dueRelearning). list_decks and check_pressure return this same object for every deck. Errors if the deck id is unknown.",
     inputSchema: { deckId: z.string() },
   },
   async (args) => j(await getDeckStats(args.deckId))
@@ -258,13 +267,24 @@ server.registerTool(
   "create_card",
   {
     description:
-      "Create a new flashcard. Returns card and duplicate warnings. When splitting or deriving a card from an existing one, pass inheritFrom with the source card's id so the new card keeps the parent's FSRS schedule (due, stability, interval, state) instead of resetting to a fresh New card. Creation is blocked with an error while check_pressure reads pause (50+ reviews due, or 10+ cards added today); splits via inheritFrom are exempt.",
+      "Create a new flashcard. Returns the card and, when it resembles existing cards in the same deck, a duplicateWarning; the card is created even when duplicateWarning.isDuplicate is true. When splitting or deriving a card from an existing one, pass inheritFrom with the source card's id so the new card keeps the parent's FSRS schedule (due, stability, interval, state) instead of resetting to a fresh New card. Creation is blocked with an error while check_pressure reads pause (50+ reviews due, or 10+ cards added today); splits via inheritFrom are exempt. Front and back are simple HTML, the only format Anki renders reliably; content that breaks the rules on those two parameters is rejected with an error listing each violation.",
     inputSchema: {
-      deckId: z.string(),
-      front: z.string(),
-      back: z.string(),
+      deckId: z.string().describe("Deck id from list_decks, not the deck name"),
+      front: z
+        .string()
+        .describe(
+          "Question side, as simple HTML: <b>, <i>, <code>, <pre>, <ul>/<ol>/<li>, <br>. Must ask one question. Rejected: Markdown (backticks, **bold**, list lines), [[wikilinks]], em dashes, and newlines outside <pre>."
+        ),
+      back: z
+        .string()
+        .describe(
+          "Answer side, as simple HTML with the same format rules as front. Rejected above 200 visible characters or 4 sentences; markup does not count toward either limit."
+        ),
       tags: z.array(z.string()).optional(),
-      type: z.enum(["guided", "unguided"]).optional(),
+      type: z
+        .enum(["guided", "unguided"])
+        .optional()
+        .describe("unguided marks an exercise card, which practiceFirst sessions serve first (default guided)"),
       category: z.string().optional().describe("Card category"),
       inheritFrom: z
         .string()
@@ -303,7 +323,8 @@ server.registerTool(
 server.registerTool(
   "get_card",
   {
-    description: "Get a single card by ID with all fields.",
+    description:
+      "Get a single card by ID: id, deckId, front, back, tags (comma-separated string), category, type, maturity, state (FSRS state number: 0 new, 1 learning, 2 review, 3 relearning), reps, lapses, stability, due and suspended. Other columns (difficulty, interval, lastReview, leech flags) are not returned. Returns an error result with \"Card not found\" for an unknown ID.",
     inputSchema: { cardId: z.string() },
   },
   async (args) => {
@@ -334,12 +355,12 @@ server.registerTool(
   "update_card",
   {
     description:
-      "Update a card's front, back, or tags. Updating a card that get_next_card flagged as a leech also clears the flag and resets its lapse count to 0: those lapses were earned by the old wording, and the rewrite is the resolution. Cards with no flag keep their lapse count.",
+      "Update a card's front, back, tags, or category; fields you omit stay unchanged. Returns id, front, back and tags. A new front or back must follow the same content rules as in create_card, or the update is rejected with an error listing each violation. Updating a card that get_next_card flagged as a leech also clears the flag and resets its lapse count to 0: those lapses were earned by the old wording, and the rewrite is the resolution. Cards with no flag keep their lapse count.",
     inputSchema: {
       cardId: z.string(),
-      front: z.string().optional(),
-      back: z.string().optional(),
-      tags: z.string().optional().describe("Comma-separated tags"),
+      front: z.string().optional().describe("New question side, as simple HTML (same rules as create_card's front)"),
+      back: z.string().optional().describe("New answer side, as simple HTML (same rules and limits as create_card's back)"),
+      tags: z.string().optional().describe("Comma-separated tags; replaces all existing tags"),
       category: z
         .string()
         .nullable()
@@ -412,7 +433,8 @@ server.registerTool(
 server.registerTool(
   "suspend_card",
   {
-    description: "Fully suspend a card (won't appear in sessions).",
+    description:
+      "Suspend a card: new sessions leave it out and due counts skip it, but a session that already queued it still serves it. A suspended card still counts toward cards added today. Returns suspended: true.",
     inputSchema: { cardId: z.string() },
   },
   async (args) => {
@@ -427,7 +449,7 @@ server.registerTool(
     description:
       "List cards with optional deck/tag/state filters and pagination. tagFilter accepts 'empty' (untagged), 'has_any' (any tag), or an exact tag string. state filters by FSRS state. Returns id, truncated front/back, tags array, maturity, lapses, deckId. Default limit 50 (max 200).",
     inputSchema: {
-      deckId: z.string().optional(),
+      deckId: z.string().optional().describe("Deck id from list_decks, not the deck name, which matches nothing"),
       tagFilter: z.string().optional().describe("'empty' | 'has_any' | exact tag string"),
       category: z
         .string()
@@ -482,12 +504,19 @@ server.registerTool(
 server.registerTool(
   "search_cards",
   {
-    description: "Search cards by text query and optional filters.",
+    description:
+      "Find cards whose front or back contains the query text: a substring match, not a similarity score (find_similar_cards scores similarity). Returns at most 100 cards, newest first, with full front and back, tags as a comma-separated string, maturity and state.",
     inputSchema: {
-      query: z.string(),
-      deckId: z.string().optional(),
-      tags: z.array(z.string()).optional(),
-      category: z.string().optional(),
+      query: z.string().describe("Text to find in front or back; an empty string matches every card that passes the filters"),
+      deckId: z.string().optional().describe("Deck id from list_decks, not the deck name"),
+      tags: z
+        .array(z.string())
+        .optional()
+        .describe("Each listed tag must appear in the card's tags as a substring, so a short tag also matches longer tags that contain it"),
+      category: z
+        .string()
+        .optional()
+        .describe("Exact category name, or '__uncategorized__' for null, or '__any__' for any category."),
     },
   },
   async (args) => {
@@ -513,7 +542,7 @@ server.registerTool(
   "get_due_cards",
   {
     description:
-      "Returns the total number of cards due now plus a preview of up to 30 (ordered by due date ascending). `totalDue` is the real backlog size; `preview` may be shorter. If you need every due card, use list_cards with additional filters.",
+      "Returns the number of unsuspended cards due now plus a preview of up to 30 of them (ordered by due date ascending). `totalDue` counts New cards too, so it is not the review backlog: check_pressure's flashcardsDue is. `preview` may be shorter than `totalDue` (then `hasMore` is true); each entry carries the front cut to 80 characters, the deck name, state and maturity. No tool lists every due card: list_cards has no due-date filter.",
   },
   async () => {
     const db = getDb();
@@ -540,7 +569,8 @@ server.registerTool(
 server.registerTool(
   "get_session_history",
   {
-    description: "Get recent study session history.",
+    description:
+      "Get the most recent study sessions, newest first, as stored: id, startTime, endTime, cardsReviewed, newCards, accuracy and queueState. endTime stays null until end_session closes the session, so an abandoned session keeps a null endTime. queueState is the queue of a session that can still be resumed, as JSON, and null once its queue is used up or it has ended.",
     inputSchema: {
       limit: z.number().optional().describe("Number of sessions (default 10)"),
     },
@@ -552,10 +582,10 @@ server.registerTool(
   "find_similar_cards",
   {
     description:
-      "Find cards semantically similar to a given text. Uses both word-overlap and embedding similarity. Useful for checking if a card already exists before creating it.",
+      "Find cards similar to a given text: word overlap with each card's front (50% and up), plus embedding similarity to each card's front and back once the embedding model has loaded in this server process. The model starts loading in the background on the first create_card, or update_card that changes a front or back; until it has loaded, results come from word overlap alone. Useful for checking if a card already exists before creating it. Returns count (all matches) and the 10 most similar cards.",
     inputSchema: {
       text: z.string().describe("The card front text to check against existing cards"),
-      deckId: z.string().optional().describe("Limit search to this deck (optional)"),
+      deckId: z.string().optional().describe("Limit search to this deck (optional); a deck id from list_decks, not the deck name, which matches nothing"),
       threshold: z.number().optional().describe("Cosine similarity threshold 0-1 (default 0.45)"),
     },
   },
