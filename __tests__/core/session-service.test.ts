@@ -1,4 +1,6 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import type { Grade } from "ts-fsrs";
+import { getTestDb } from "../setup.js";
 import {
   startSession,
   getNextCard,
@@ -354,7 +356,7 @@ describe("session-service", () => {
       const card1 = await getNextCard(session.id);
       expect(card1).not.toBeNull();
 
-      const skipped = skipCard(session.id);
+      const skipped = await skipCard(session.id);
       expect(skipped).toBe(true);
 
       const card2 = await getNextCard(session.id);
@@ -369,16 +371,16 @@ describe("session-service", () => {
       expect(reviews.length).toBe(0);
     });
 
-    it("returns false for unknown session", () => {
-      expect(skipCard("nonexistent")).toBe(false);
+    it("returns false for unknown session", async () => {
+      expect(await skipCard("nonexistent")).toBe(false);
     });
 
     it("allows exhausting the queue via skips", async () => {
       await seedCards(2);
       const session = await startSession();
 
-      skipCard(session.id);
-      skipCard(session.id);
+      await skipCard(session.id);
+      await skipCard(session.id);
 
       const card = await getNextCard(session.id);
       expect(card).toBeNull();
@@ -474,14 +476,14 @@ describe("session-service", () => {
       const session = await startSession();
 
       await getNextCard(session.id);
-      expect(getQueuePosition(session.id)).toEqual({ position: 1, total: 3, repeat: false });
+      expect(await getQueuePosition(session.id)).toEqual({ position: 1, total: 3, repeat: false });
 
       const card = await getNextCard(session.id);
-      expect(getQueuePosition(session.id)).toEqual({ position: 1, total: 3, repeat: false });
+      expect(await getQueuePosition(session.id)).toEqual({ position: 1, total: 3, repeat: false });
 
       await submitReview(session.id, card!.id, Rating.Good);
       await getNextCard(session.id);
-      expect(getQueuePosition(session.id)).toEqual({ position: 2, total: 3, repeat: false });
+      expect(await getQueuePosition(session.id)).toEqual({ position: 2, total: 3, repeat: false });
     });
 
     it("raises the total by one on the serve after an Again re-queues", async () => {
@@ -493,7 +495,7 @@ describe("session-service", () => {
       expect(schedule.intraDay).toBe(true);
 
       await getNextCard(session.id);
-      expect(getQueuePosition(session.id)).toEqual({ position: 2, total: 4, repeat: false });
+      expect(await getQueuePosition(session.id)).toEqual({ position: 2, total: 4, repeat: false });
     });
 
     it("flags the re-served learning repeat", async () => {
@@ -507,7 +509,7 @@ describe("session-service", () => {
 
       const repeat = await getNextCard(session.id);
       expect(repeat!.id).toBe(first!.id);
-      expect(getQueuePosition(session.id)).toEqual({ position: 3, total: 3, repeat: true });
+      expect(await getQueuePosition(session.id)).toEqual({ position: 3, total: 3, repeat: true });
     });
 
     it("counts a skipped card as a position without changing the total", async () => {
@@ -515,9 +517,9 @@ describe("session-service", () => {
       const session = await startSession();
 
       await getNextCard(session.id);
-      skipCard(session.id);
+      await skipCard(session.id);
       await getNextCard(session.id);
-      expect(getQueuePosition(session.id)).toEqual({ position: 2, total: 3, repeat: false });
+      expect(await getQueuePosition(session.id)).toEqual({ position: 2, total: 3, repeat: false });
     });
 
     it("keeps position and total steady when a deleted card is topped up", async () => {
@@ -530,7 +532,7 @@ describe("session-service", () => {
       await deleteCard(session.queue[1].cardId);
 
       await getNextCard(session.id);
-      expect(getQueuePosition(session.id)).toEqual({ position: 2, total: 3, repeat: false });
+      expect(await getQueuePosition(session.id)).toEqual({ position: 2, total: 3, repeat: false });
     });
 
     it("drops the total by one when a deleted card has no replacement", async () => {
@@ -542,11 +544,11 @@ describe("session-service", () => {
       await deleteCard(session.queue[1].cardId);
 
       await getNextCard(session.id);
-      expect(getQueuePosition(session.id)).toEqual({ position: 2, total: 2, repeat: false });
+      expect(await getQueuePosition(session.id)).toEqual({ position: 2, total: 2, repeat: false });
     });
 
-    it("returns null for an unknown session", () => {
-      expect(getQueuePosition("nope")).toBeNull();
+    it("returns null for an unknown session", async () => {
+      expect(await getQueuePosition("nope")).toBeNull();
     });
   });
 
@@ -686,5 +688,39 @@ describe("session-service", () => {
         expect(row!.endTime!.getTime()).toBe(ended!.endTime!.getTime());
       });
     });
+  });
+});
+
+describe("session persistence", () => {
+  // A fresh module instance is a fresh process: an empty cache over the same
+  // database. The session must carry on from its row.
+  async function restartedService() {
+    vi.resetModules();
+    const client = await import("../../src/db/client.js");
+    client.setDb(getTestDb());
+    return import("../../src/core/session-service.js");
+  }
+
+  it("survives a restart: same position, same remaining queue", async () => {
+    const deck = await createDeck("Persist");
+    const db = getDb();
+    for (let i = 0; i < 3; i++) {
+      await db.card.create({ data: { deckId: deck.id, front: `Q${i}`, back: `A${i}` } });
+    }
+    const session = await startSession();
+    const first = await getNextCard(session.id);
+    await submitReview(session.id, first!.id, Rating.Easy as Grade);
+    const before = await getNextCard(session.id);
+    const positionBefore = await getQueuePosition(session.id);
+
+    const fresh = await restartedService();
+    const after = await fresh.getNextCard(session.id);
+    expect(after?.id).toBe(before?.id);
+    expect(await fresh.getQueuePosition(session.id)).toEqual(positionBefore);
+
+    await fresh.endSession(session.id);
+    const row = await db.studySession.findUnique({ where: { id: session.id } });
+    expect(row?.queueState).toBeNull();
+    expect(await (await restartedService()).getNextCard(session.id)).toBeNull();
   });
 });

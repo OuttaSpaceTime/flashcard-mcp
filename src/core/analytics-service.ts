@@ -1,6 +1,7 @@
 import { getDb } from "../db/client.js";
 import { cardMaturity, getRetrievability, toSchedulableCard } from "./scheduler.js";
 import { State } from "ts-fsrs";
+import { localDay } from "./days.js";
 
 export async function getStudyStreak(): Promise<number> {
   const db = getDb();
@@ -12,14 +13,12 @@ export async function getStudyStreak(): Promise<number> {
 
   if (sessions.length === 0) return 0;
 
-  const days = new Set(
-    sessions.map((s) => s.startTime.toISOString().split("T")[0])
-  );
+  // Local study days (core/days.ts), like every other day count here.
+  const days = new Set(sessions.map((s) => localDay(s.startTime)));
 
-  const toDateStr = (d: Date) => d.toISOString().split("T")[0]!;
   let streak = 0;
   const checkDate = new Date();
-  while (days.has(toDateStr(checkDate))) {
+  while (days.has(localDay(checkDate))) {
     streak++;
     checkDate.setDate(checkDate.getDate() - 1);
   }

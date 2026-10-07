@@ -79,6 +79,9 @@ model StudySession {
   cardsReviewed  Int       @default(0)
   newCards       Int       @default(0)
   accuracy       Float     @default(0)
+  // The open session's queue and position, as JSON (session-service.ts), so a
+  // session outlives the process that started it. Null once it has ended.
+  queueState     String?
 
   @@index([startTime])
 }

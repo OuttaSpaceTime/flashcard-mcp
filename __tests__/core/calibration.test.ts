@@ -1,3 +1,4 @@
+import { normalizeDates } from "../../src/db/normalize.js";
 import { describe, it, expect, beforeEach } from "vitest";
 import {
   MIN_REVIEWS,
@@ -290,12 +291,15 @@ describe("calibration", () => {
       expect(report.true_retention).toBeCloseTo(0.5);
     });
 
-    it("sees reviews stored as epoch-ms integers", async () => {
+    // Older Prisma wrote epoch-ms integers; every entry point runs
+    // normalizeDates at start, after which the SQL window sees them.
+    it("sees reviews stored as epoch-ms integers once dates are normalized", async () => {
       const a = await seedCard();
       const b = await seedCard();
       await seedIntegerReview(a, 3, 2);
       await seedIntegerReview(b, 1, 3);
       await seedReview(a, 3, 4);
+      await normalizeDates(getDb());
 
       const report = await checkCalibration();
       expect(report.reviews).toBe(3);
@@ -306,6 +310,7 @@ describe("calibration", () => {
       const a = await seedCard();
       await seedIntegerReview(a, 3, 2);
       await seedIntegerReview(a, 3, 400);
+      await normalizeDates(getDb());
 
       expect((await checkCalibration()).reviews).toBe(1);
     });
@@ -314,6 +319,7 @@ describe("calibration", () => {
       const a = await seedCard();
       await seedIntegerReview(a, 1, 2);
       await seedReview(a, 4, 2);
+      await normalizeDates(getDb());
 
       const report = await checkCalibration();
       expect(report.reviews).toBe(1);

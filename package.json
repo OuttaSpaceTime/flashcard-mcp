@@ -16,7 +16,8 @@
     "db:push": "prisma db push",
     "db:generate": "prisma generate",
     "dev:cli": "tsx src/cli/index.ts",
-    "dev:mcp": "tsx src/mcp/server.ts"
+    "dev:mcp": "tsx src/mcp/server.ts",
+    "dev:app": "tsx src/app/server.ts"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.0.0",

@@ -17,6 +17,18 @@ describe("analytics-service", () => {
       expect(streak).toBe(0);
     });
 
+    // A study day is a local calendar day: a session just after local
+    // midnight belongs to today even where that instant is yesterday in UTC.
+    it("counts a session just after local midnight as today", async () => {
+      const now = new Date();
+      const justAfterMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 30);
+      if (justAfterMidnight > now) return; // the first half hour of a day: nothing to test yet
+      await getDb().studySession.create({
+        data: { cardsReviewed: 3, startTime: justAfterMidnight, endTime: justAfterMidnight },
+      });
+      expect(await getStudyStreak()).toBe(1);
+    });
+
     it("returns 1 for a session today", async () => {
       const db = getDb();
       await db.studySession.create({

@@ -4,6 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { createClient, setDb, getDb } from "../db/client.js";
+import { normalizeDates } from "../db/normalize.js";
 import { listDecks, getDeckStats, deleteDeck } from "../core/deck-service.js";
 import { cardMaturity } from "../core/scheduler.js";
 import {
@@ -96,7 +97,7 @@ server.registerTool(
     const card = await getNextCard(args.sessionId);
     if (card == null) return j({ done: true, message: "No more cards in queue" });
     const leech = leechPayload(card);
-    const queuePosition = getQueuePosition(args.sessionId);
+    const queuePosition = await getQueuePosition(args.sessionId);
     return j({
       ...(queuePosition ?? {}),
       id: card.id,
@@ -146,7 +147,7 @@ server.registerTool(
     inputSchema: { sessionId: z.string() },
   },
   async (args) => {
-    const skipped = skipCard(args.sessionId);
+    const skipped = await skipCard(args.sessionId);
     return j({ skipped });
   }
 );
@@ -576,6 +577,7 @@ server.registerTool(
 
 // Start server
 async function main() {
+  await normalizeDates(prisma);
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

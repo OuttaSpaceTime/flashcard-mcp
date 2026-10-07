@@ -2,6 +2,7 @@
 
 import { Command } from "commander";
 import { createClient, setDb } from "../db/client.js";
+import { normalizeDates } from "../db/normalize.js";
 import { createDeck, listDecks, getDeckStats, getDeckByName, getOrCreateDeck } from "../core/deck-service.js";
 import { parseTags } from "../core/types.js";
 import { createCard, searchCards, backfillEmbeddings, updateCard, CARD_STATE_BY_NAME } from "../core/card-service.js";
@@ -23,6 +24,7 @@ import { parseAnkiTxt, importTxtNotes, exportCardsToAnkiTxt } from "../core/anki
 import { exportToApkg, importFromApkg, importApkgCards } from "../core/anki-apkg.js";
 import { dumpDatabase, restoreDatabase } from "../core/db-dump.js";
 import { checkCalibration } from "../core/calibration.js";
+import { getOverview } from "../app/overview.js";
 
 function defaultDbPath(): string {
   const url = process.env["DATABASE_URL"] ?? "file:./prisma/master.db";
@@ -395,6 +397,16 @@ program
     console.log(JSON.stringify(await checkCalibration(), null, 2));
   });
 
+// --- overview ---
+program
+  .command("overview")
+  .description("Pending cards and a rough progress picture, as JSON (the Omvida bar panel reads it)")
+  .option("--pending <n>", "How many pending cards to list", "8")
+  .action(async (opts: { pending: string }) => {
+    // stdout is a machine interface, as for `calibration`: the JSON and nothing else.
+    console.log(JSON.stringify(await getOverview({ pendingLimit: Number(opts.pending) })));
+  });
+
 // --- topics ---
 program
   .command("topics")
@@ -623,4 +635,6 @@ program
   });
 
 // Run
-void program.parseAsync(process.argv).then(() => prisma.$disconnect());
+void normalizeDates(prisma)
+  .then(() => program.parseAsync(process.argv))
+  .then(() => prisma.$disconnect());

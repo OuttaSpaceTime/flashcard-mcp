@@ -67,14 +67,18 @@ export async function leechResolutionFor(id: string): Promise<Partial<typeof LEE
   return card?.leechFlaggedAt != null ? LEECH_RESOLVED : {};
 }
 
+/** Cards whose flag the developer has not answered, oldest flag first. */
+export async function findUnresolvedLeeches(): Promise<PrismaCard[]> {
+  const flagged = await getDb().card.findMany({
+    where: { leechFlaggedAt: { not: null } },
+    orderBy: { leechFlaggedAt: "asc" },
+  });
+  return flagged.filter(isUnresolvedLeech);
+}
+
 /** Throws while any card carries a flag the developer has not answered. */
 export async function assertNoUnresolvedLeech(): Promise<void> {
-  const db = getDb();
-  const flagged = await db.card.findMany({
-    where: { leechFlaggedAt: { not: null } },
-    select: { id: true, lapses: true, leechFlaggedAt: true, leechDeferredLapses: true },
-  });
-  const unresolved = flagged.filter(isUnresolvedLeech);
+  const unresolved = await findUnresolvedLeeches();
   if (unresolved.length === 0) return;
 
   const blocks = unresolved.map(

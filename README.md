@@ -45,6 +45,10 @@ npm run dev:cli -- db:restore <file> [--force]
 
 After `npm run build`, the CLI is available as the `master` binary.
 
+## App server (Omvida)
+
+`npm run dev:app` (`src/app/server.ts`) is what the [Omvida](../omvida) desktop app talks to: JSON lines over stdio, one long-lived process per app. It exposes the study loop (`startSession`, `nextCard`, `grade`, `review`, `skip`, `endSession`, `resolveLeech`), the deck for browsing (`cards`, `cardsByIds`, `searchCards`, `recentlyStudied`), and `overview`. `grade` asks `claude -p` for a suggested rating with a one-sentence reason (`src/core/grading.ts`); the developer accepts or overrides it before anything is written. `master overview` prints the same overview as JSON for the Omvida bar widget.
+
 ## MCP server
 
 ```bash

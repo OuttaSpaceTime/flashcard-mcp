@@ -1,4 +1,5 @@
 import { getDb } from "../db/client.js";
+import { localDay, systemTimeZone } from "./days.js";
 
 /**
  * Study calibration — true retention, rating discrimination, difficulty verdict.
@@ -83,10 +84,6 @@ const RATING_NAMES: Record<number, keyof RatingMix> = {
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
-function systemTimeZone(): string {
-  return Intl.DateTimeFormat().resolvedOptions().timeZone;
-}
-
 function pct(value: number): string {
   return `${Math.round(value * 100)}%`;
 }
@@ -110,17 +107,9 @@ export function eligibleReviews(
     .filter((r) => r.reviewedAt.getTime() >= cutoff && r.elapsedDays >= 1)
     .sort((a, b) => a.reviewedAt.getTime() - b.reviewedAt.getTime());
 
-  // en-CA renders as YYYY-MM-DD, so the formatted day doubles as its own key.
-  const day = new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-
   const firstPerCardDay = new Map<string, CalibrationReview>();
   for (const review of inWindow) {
-    const key = `${review.cardId}|${day.format(review.reviewedAt)}`;
+    const key = `${review.cardId}|${localDay(review.reviewedAt, timeZone)}`;
     if (!firstPerCardDay.has(key)) firstPerCardDay.set(key, review);
   }
   return [...firstPerCardDay.values()];
@@ -205,25 +194,23 @@ export function calibrationVerdict(rows: CalibrationReview[]): {
 }
 
 /**
- * Every review row, decoded to Date, windowed in JS rather than in SQL.
- *
- * `Review.reviewedAt` holds epoch-ms INTEGERs (written by older Prisma) beside
- * ISO TEXT (written by current Prisma) — master.db is ~75% integer. SQLite
- * orders every INTEGER before every TEXT regardless of the instant each
- * represents, so `where: { reviewedAt: { gte: cutoff } }` silently drops integer
- * rows: measured against master.db, a 400-day cutoff matched 666 rows where 1849
- * qualify. Prisma decodes both storage formats correctly on read, so pulling the
- * rows and filtering them here is the exact version of the same query.
+ * The reviews in the calibration window, read with a SQL window. That is safe
+ * because DateTime columns are uniform ISO text (src/db/normalize.ts runs on
+ * every start); before that, integer rows sorted before every text row and a
+ * `where` on the column silently dropped most of the history.
  */
-async function readReviews(): Promise<CalibrationReview[]> {
-  const db = getDb();
-  return db.review.findMany({
+async function readReviews(windowDays: number): Promise<CalibrationReview[]> {
+  // A day of slack: eligibleReviews applies the exact cutoff and the local-day
+  // rule; this only keeps the rest of the history out of memory.
+  const since = new Date(Date.now() - (windowDays + 1) * MS_PER_DAY);
+  return getDb().review.findMany({
+    where: { reviewedAt: { gte: since } },
     select: { cardId: true, rating: true, reviewedAt: true, elapsedDays: true },
   });
 }
 
 export async function checkCalibration(): Promise<CalibrationReport> {
-  const rows = eligibleReviews(await readReviews(), WINDOW_DAYS);
+  const rows = eligibleReviews(await readReviews(WINDOW_DAYS), WINDOW_DAYS);
   const { verdict, reasons } = calibrationVerdict(rows);
   const retention = trueRetention(rows);
 

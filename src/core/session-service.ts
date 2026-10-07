@@ -30,7 +30,42 @@ interface SessionState {
   category?: string;
 }
 
+/**
+ * Open sessions. The map is this process's cache; the truth is
+ * `StudySession.queueState`, written on every change, so a session survives a
+ * restart of the server driving it (the MCP server, or the Omvida app's) and
+ * any process can pick it up. One process drives a session at a time: a cache
+ * is not shared, so two processes advancing the same session would race.
+ */
 const sessions = new Map<string, SessionState>();
+
+/** The session's state from the cache, or from its row; undefined once ended. */
+async function loadState(sessionId: string): Promise<SessionState | undefined> {
+  const cached = sessions.get(sessionId);
+  if (cached) return cached;
+  const row = await getDb().studySession.findUnique({
+    where: { id: sessionId },
+    select: { queueState: true, endTime: true },
+  });
+  if (row?.queueState == null || row.endTime != null) return undefined;
+  const state = JSON.parse(row.queueState) as SessionState;
+  sessions.set(sessionId, state);
+  return state;
+}
+
+async function saveState(sessionId: string, state: SessionState): Promise<void> {
+  sessions.set(sessionId, state);
+  await getDb().studySession.update({
+    where: { id: sessionId },
+    data: { queueState: JSON.stringify(state) },
+  });
+}
+
+/** The queue is used up or the session ended: nothing left to resume. */
+async function dropState(sessionId: string): Promise<void> {
+  sessions.delete(sessionId);
+  await getDb().studySession.updateMany({ where: { id: sessionId }, data: { queueState: null } });
+}
 
 interface StartSessionResult {
   id: string;
@@ -113,15 +148,9 @@ export async function startSession(
   }
 
   const queue = [...unguidedQueue, ...reviewQueue, ...guidedNewQueue];
-  const session = await db.studySession.create({ data: {} });
-
-  sessions.set(session.id, {
-    queue,
-    pointer: 0,
-    goodCount: 0,
-    dropped: 0,
-    category: categoryFilter,
-  });
+  const state: SessionState = { queue, pointer: 0, goodCount: 0, dropped: 0, category: categoryFilter };
+  const session = await db.studySession.create({ data: { queueState: JSON.stringify(state) } });
+  sessions.set(session.id, state);
 
   return { id: session.id, queue };
 }
@@ -134,7 +163,7 @@ export async function getNextCard(
   // before any more studying happens.
   await assertNoUnresolvedLeech();
 
-  const state = sessions.get(sessionId);
+  const state = await loadState(sessionId);
   if (!state) return null;
 
   const db = getDb();
@@ -144,16 +173,21 @@ export async function getNextCard(
   // findUnique return null, ending the session and stranding the
   // cards queued behind it. For each deleted card, pull in one
   // replacement new card so the session keeps its intended size.
+  let skippedDeleted = false;
   while (state.pointer < state.queue.length) {
     const item = state.queue[state.pointer];
     const card = await db.card.findUnique({ where: { id: item.cardId } });
-    if (card) return flagLeechOnServe(card);
+    if (card) {
+      if (skippedDeleted) await saveState(sessionId, state);
+      return flagLeechOnServe(card);
+    }
     state.pointer += 1;
     state.dropped += 1;
+    skippedDeleted = true;
     await topUpNewCard(state);
   }
 
-  sessions.delete(sessionId);
+  await dropState(sessionId);
   return null;
 }
 
@@ -173,8 +207,8 @@ export interface QueuePosition {
  * takes its place, so the total only drops when no new card is left).
  * Returns null for an unknown or exhausted session.
  */
-export function getQueuePosition(sessionId: string): QueuePosition | null {
-  const state = sessions.get(sessionId);
+export async function getQueuePosition(sessionId: string): Promise<QueuePosition | null> {
+  const state = await loadState(sessionId);
   if (!state || state.pointer >= state.queue.length) return null;
   return {
     position: state.pointer + 1 - state.dropped,
@@ -263,7 +297,7 @@ export async function submitReview(
     result.card.due.getTime() - Date.now() < 24 * 60 * 60 * 1000;
 
   // Update session stats
-  const state = sessions.get(sessionId);
+  const state = await loadState(sessionId);
   const isNewCard = card.state === State.New;
   const isGood = rating === Rating.Good || rating === Rating.Easy;
   if (state) {
@@ -285,6 +319,7 @@ export async function submitReview(
       cardsReviewed: { increment: 1 },
       accuracy,
       ...(isNewCard ? { newCards: { increment: 1 } } : {}),
+      ...(state ? { queueState: JSON.stringify(state) } : {}),
     },
   });
 
@@ -313,7 +348,7 @@ export async function endSession(sessionId: string) {
 
   return db.studySession.update({
     where: { id: sessionId },
-    data: { endTime: new Date() },
+    data: { endTime: new Date(), queueState: null },
   });
 }
 
@@ -332,10 +367,11 @@ async function discardEmptySessions(): Promise<void> {
   await db.studySession.deleteMany({ where: { endTime: null, cardsReviewed: 0 } });
 }
 
-export function skipCard(sessionId: string): boolean {
-  const state = sessions.get(sessionId);
+export async function skipCard(sessionId: string): Promise<boolean> {
+  const state = await loadState(sessionId);
   if (!state) return false;
   state.pointer += 1;
+  await saveState(sessionId, state);
   return true;
 }
 
@@ -343,7 +379,7 @@ export async function adjustSession(
   sessionId: string,
   adjustment: SessionAdjustment
 ): Promise<{ queue: SessionQueueItem[] }> {
-  const state = sessions.get(sessionId);
+  const state = await loadState(sessionId);
   const queue = state?.queue ?? [];
   const pointer = state?.pointer ?? 0;
 
@@ -373,6 +409,7 @@ export async function adjustSession(
 
   if (state) {
     state.queue = [...queue.slice(0, pointer), ...remaining];
+    await saveState(sessionId, state);
   }
 
   return { queue: remaining };
