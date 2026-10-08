@@ -73,15 +73,23 @@ describe("app handlers", () => {
       card: { id: string; deck: string; tags: string[]; state: string };
       position: number;
       total: number;
+      schedules: Record<string, { interval: number; intraDay: boolean }>;
     };
     expect(next.position).toBe(1);
     expect(next.total).toBe(1);
     expect(next.card.deck).toBe("Web");
     expect(next.card.tags).toEqual(["http", "web"]);
     expect(next.card.state).toBe("review");
+    expect(Object.keys(next.schedules)).toEqual(["1", "2", "3", "4"]);
+    expect(next.schedules[1].intraDay).toBe(true);
+    expect(next.schedules[2].interval).toBeLessThanOrEqual(next.schedules[3].interval);
+    expect(next.schedules[3].interval).toBeLessThanOrEqual(next.schedules[4].interval);
 
-    const sched = (await h.review({ sessionId: s.sessionId, cardId: next.card.id, rating: 3 })) as { interval: number };
+    const sched = (await h.review({ sessionId: s.sessionId, cardId: next.card.id, rating: 3 })) as { interval: number; intraDay: boolean };
     expect(sched.interval).toBeGreaterThanOrEqual(1);
+    // The key said where the card would go, and it went there.
+    expect(sched.interval).toBe(next.schedules[3].interval);
+    expect(sched.intraDay).toBe(next.schedules[3].intraDay);
     expect(await h.nextCard({ sessionId: s.sessionId })).toEqual({ done: true });
 
     const ended = (await h.endSession({ sessionId: s.sessionId })) as { cardsReviewed: number; endTime: string };

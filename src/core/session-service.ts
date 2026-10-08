@@ -250,6 +250,33 @@ export type ReviewSchedule = {
   intraDay: boolean;
 };
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function toReviewSchedule(result: ReturnType<typeof scheduleReview>, now: Date): ReviewSchedule {
+  return {
+    due: result.card.due.toISOString(),
+    interval: result.card.interval,
+    state: result.card.state,
+    // A card resurfacing in under a day is an intra-day learning step.
+    intraDay: result.card.due.getTime() - now.getTime() < DAY_MS,
+  };
+}
+
+/**
+ * What each rating would schedule for a card, without writing anything: the
+ * app shows it on the rating keys. It runs the same FSRS step and the same
+ * intra-day rule as `submitReview`, so a rating lands where its key said, up
+ * to the minutes that pass between the preview and the review.
+ */
+export function previewSchedules(
+  card: Parameters<typeof toSchedulableCard>[0],
+  now: Date = new Date()
+): Record<Grade, ReviewSchedule> {
+  const schedulable = toSchedulableCard(card);
+  const at = (rating: Grade) => toReviewSchedule(scheduleReview(schedulable, rating, now), now);
+  return { 1: at(1), 2: at(2), 3: at(3), 4: at(4) };
+}
+
 export async function submitReview(
   sessionId: string,
   cardId: string,
@@ -262,8 +289,11 @@ export async function submitReview(
   if (!card) throw new Error(`Card not found: ${cardId}`);
 
   // Schedule via FSRS
+  const now = new Date();
   const schedulable = toSchedulableCard(card);
-  const result = scheduleReview(schedulable, rating);
+  const result = scheduleReview(schedulable, rating, now);
+  const schedule = toReviewSchedule(result, now);
+  const intraDay = schedule.intraDay;
 
   // Update card with new scheduling
   await db.card.update({
@@ -292,10 +322,6 @@ export async function submitReview(
     },
   });
 
-  // A card resurfacing in under a day is an intra-day learning step.
-  const intraDay =
-    result.card.due.getTime() - Date.now() < 24 * 60 * 60 * 1000;
-
   // Update session stats
   const state = await loadState(sessionId);
   const isNewCard = card.state === State.New;
@@ -323,12 +349,7 @@ export async function submitReview(
     },
   });
 
-  return {
-    due: result.card.due.toISOString(),
-    interval: result.card.interval,
-    state: result.card.state,
-    intraDay,
-  };
+  return schedule;
 }
 
 /**

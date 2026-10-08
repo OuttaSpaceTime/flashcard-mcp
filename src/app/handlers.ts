@@ -6,6 +6,7 @@ import {
   getNextCard,
   getQueuePosition,
   submitReview,
+  previewSchedules,
   skipCard,
   endSession,
 } from "../core/session-service.js";
@@ -29,6 +30,9 @@ import { localDay } from "../core/days.js";
  * - `nextCard` turns the leech block into data instead of an error. The MCP tool
  *   throws, because for Claude the error message is the instruction; the app
  *   needs the blocking card itself, to show it with the four ways out.
+ * - `nextCard` also carries `schedules`, what each rating 1-4 would schedule
+ *   (submitReview's shape, keyed by rating), so the rating keys can say where
+ *   they send the card. /study has no keys to label.
  *
  * The app talks to one server for its whole life rather than running the CLI
  * per call: a start costs about a second, and session-service caches open
@@ -125,6 +129,7 @@ export function createHandlers(deps: { runner?: ClaudeRunner } = {}): Record<str
         total: position?.total ?? null,
         repeat: position?.repeat ?? false,
         leech,
+        schedules: previewSchedules(card),
       };
     },
 
