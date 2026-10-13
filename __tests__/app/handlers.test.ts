@@ -4,6 +4,7 @@ import { createHandlers } from "../../src/app/handlers.js";
 import { dispatch } from "../../src/app/server.js";
 import { bucketWeek } from "../../src/app/overview.js";
 import { localDay } from "../../src/core/days.js";
+import { updateCard } from "../../src/core/card-service.js";
 import { createDeck } from "../../src/core/deck-service.js";
 import { getDb } from "../../src/db/client.js";
 import type { ClaudeRunner } from "../../src/core/grading.js";
@@ -125,6 +126,91 @@ describe("app handlers", () => {
     expect(all.map((c) => c.deck)).toEqual(["Web"]);
     const found = (await h.searchCards({ query: "Question" })) as { deck: string }[];
     expect(found[0].deck).toBe("Web");
+  });
+
+  it("moves the stamp on an edit or a delete, and not on a read", async () => {
+    const [a, b] = await seed(2);
+    const stamp = async () => ((await h.stamp({})) as { stamp: string }).stamp;
+    const first = await stamp();
+    await h.cards({});
+    expect(await stamp()).toBe(first);
+
+    // Past the millisecond the seed wrote in, so the new updatedAt is larger.
+    await new Promise((r) => setTimeout(r, 5));
+    await updateCard(a.id, { back: "A better answer" });
+    const edited = await stamp();
+    expect(edited).not.toBe(first);
+
+    await h.deleteCard({ cardId: b.id });
+    expect(await stamp()).not.toBe(edited);
+  });
+
+  it("moves the reviews token, not the cards', on a review and a leech flag", async () => {
+    await seed(1, { state: State.Review, lapses: 8 });
+    const stamp = async () => (await h.stamp({})) as { stamp: string; reviews: string };
+    const first = await stamp();
+    await new Promise((r) => setTimeout(r, 5));
+    const s = (await h.startSession({})) as { sessionId: string };
+    const next = (await h.nextCard({ sessionId: s.sessionId })) as { card?: { id: string }; blocked?: { card: { id: string } } };
+    const id = next.card?.id ?? next.blocked!.card.id;
+    expect((await stamp()).stamp).toBe(first.stamp);
+    await h.review({ sessionId: s.sessionId, cardId: id, rating: 3 });
+    const reviewed = await stamp();
+    expect(reviewed.stamp).toBe(first.stamp);
+    expect(reviewed.reviews).not.toBe(first.reviews);
+  });
+
+  it("moves the notes token, not the cards', when a note is written or resolved", async () => {
+    const [a] = await seed(1);
+    const stamp = async () => (await h.stamp({})) as { stamp: string; notes: string };
+    const first = await stamp();
+    await h.setNote({ cardId: a.id, body: "reword the front" });
+    const noted = await stamp();
+    expect(noted.notes).not.toBe(first.notes);
+    expect(noted.stamp).toBe(first.stamp);
+    await h.setNote({ cardId: a.id, body: "" });
+    expect((await stamp()).notes).not.toBe(noted.notes);
+  });
+
+  it("writes, lists and clears card notes", async () => {
+    const [a, b] = await seed(2);
+    const saved = (await h.setNote({ cardId: b.id, body: "split it" })) as { cardId: string; body: string };
+    expect(saved).toMatchObject({ cardId: b.id, body: "split it" });
+    await h.setNote({ cardId: a.id, body: "why?" });
+    const notes = (await h.notes({})) as { cardId: string; body: string }[];
+    expect(notes.map((n) => n.cardId)).toEqual([b.id, a.id]);
+    expect(await h.setNote({ cardId: b.id, body: "  " })).toBeNull();
+    expect(((await h.notes({})) as unknown[]).length).toBe(1);
+    await expect(h.setNote({ body: "x" })).rejects.toThrow(/cardId/);
+  });
+
+  it("lists recent sessions with what each lapsed and noted, by time window", async () => {
+    const [a, b, c] = await seed(3, { state: State.Review });
+    const db = getDb();
+    const t = Date.now();
+    const at = (ago: number) => new Date(t - ago);
+    const review = (cardId: string, rating: number, ago: number) =>
+      db.review.create({ data: { cardId, rating, stability: 1, difficulty: 5, elapsedDays: 1, reviewedAt: at(ago) } });
+    // An older closed session that lapsed `a` twice and `b` once; a newer one,
+    // never closed, that lapsed `c`; one that reviewed nothing.
+    const old = await db.studySession.create({ data: { startTime: at(100_000), endTime: at(80_000), cardsReviewed: 3, accuracy: 0 } });
+    await review(a.id, 1, 95_000);
+    await review(b.id, 1, 90_000);
+    await review(a.id, 1, 85_000);
+    const open = await db.studySession.create({ data: { startTime: at(60_000), cardsReviewed: 2, accuracy: 0.5 } });
+    await review(c.id, 1, 50_000);
+    await review(a.id, 3, 40_000);
+    await db.studySession.create({ data: { startTime: at(10_000), cardsReviewed: 0 } });
+    await db.cardNote.create({ data: { cardId: b.id, body: "x", createdAt: at(88_000) } });
+    await db.cardNote.create({ data: { cardId: c.id, body: "y", createdAt: at(45_000) } });
+
+    const out = (await h.sessions({})) as { id: string; lapses: { cardId: string; front: string }[]; noted: string[] }[];
+    expect(out.map((s) => s.id)).toEqual([open.id, old.id]);
+    expect(out[0].lapses.map((l) => l.cardId)).toEqual([c.id]);
+    expect(out[0].noted).toEqual([c.id]);
+    expect(out[1].lapses.map((l) => l.cardId)).toEqual([a.id, b.id]);
+    expect(out[1].lapses[0].front).toBe("Question 1");
+    expect(out[1].noted).toEqual([b.id]);
   });
 
   it("grades through the injected runner", async () => {

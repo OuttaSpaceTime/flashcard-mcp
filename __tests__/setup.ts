@@ -10,6 +10,7 @@ let testPrisma: PrismaClient;
 
 beforeEach(async () => {
   const db = testPrisma;
+  await db.cardNote.deleteMany();
   await db.studySession.deleteMany();
   await db.review.deleteMany();
   await db.card.deleteMany();

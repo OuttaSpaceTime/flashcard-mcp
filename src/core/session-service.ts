@@ -295,10 +295,12 @@ export async function submitReview(
   const schedule = toReviewSchedule(result, now);
   const intraDay = schedule.intraDay;
 
-  // Update card with new scheduling
+  // Update card with new scheduling. updatedAt stays: it means the card's
+  // content changed (the app's stamp, handlers.ts), and a review is not that.
   await db.card.update({
     where: { id: cardId },
     data: {
+      updatedAt: card.updatedAt,
       due: result.card.due,
       stability: result.card.stability,
       difficulty: result.card.difficulty,

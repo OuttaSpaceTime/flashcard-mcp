@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createInterface } from "node:readline";
 import { createClient, setDb } from "../db/client.js";
-import { normalizeDates } from "../db/normalize.js";
+import { prepareDatabase } from "../db/prepare.js";
 import { createHandlers, type Handler } from "./handlers.js";
 
 /**
@@ -57,7 +57,7 @@ async function main(): Promise<void> {
   console.log = (...args: unknown[]) => console.error(...args);
   const db = createClient();
   setDb(db);
-  await normalizeDates(db);
+  await prepareDatabase(db);
   const handlers = createHandlers();
 
   const write = (s: string): void => {

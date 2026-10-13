@@ -16,9 +16,8 @@ A spaced-repetition flashcard system with an MCP server and CLI, built on TypeSc
 
 ```bash
 npm install
-npx prisma db push      # create the SQLite database
 npx prisma generate     # generate Prisma client
-npm run dev:cli -- init # create default decks
+npm run dev:cli -- init # create the SQLite database and default decks
 ```
 
 ## CLI
@@ -47,7 +46,7 @@ After `npm run build`, the CLI is available as the `master` binary.
 
 ## App server (Omvida)
 
-`npm run dev:app` (`src/app/server.ts`) is what the [Omvida](../omvida) desktop app talks to: JSON lines over stdio, one long-lived process per app. It exposes the study loop (`startSession`, `nextCard`, `grade`, `review`, `skip`, `endSession`, `resolveLeech`), the deck for browsing (`cards`, `cardsByIds`, `searchCards`, `recentlyStudied`), and `overview`. `grade` asks `claude -p` for a suggested rating with a one-sentence reason (`src/core/grading.ts`); the developer accepts or overrides it before anything is written. `master overview` prints the same overview as JSON for the Omvida bar widget.
+`npm run dev:app` (`src/app/server.ts`) is what the [Omvida](../omvida) desktop app talks to: JSON lines over stdio, one long-lived process per app. It exposes the study loop (`startSession`, `nextCard`, `grade`, `review`, `skip`, `endSession`, `resolveLeech`), the deck for browsing (`cards`, `cardsByIds`, `searchCards`, `recentlyStudied`), card notes (`notes`, `setNote`), recent sessions with the cards each lapsed and noted (`sessions`), `overview`, and `stamp`, a token in three parts that move whenever any process edits a card, reviews one, or writes a note, which the app polls to notice a card fixed in Claude Code. A review keeps the card's `updatedAt`, so the cards part means content edits only. `grade` asks `claude -p` for a suggested rating with a one-sentence reason (`src/core/grading.ts`); the developer accepts or overrides it before anything is written. `master overview` prints the same overview as JSON for the Omvida bar widget.
 
 ## MCP server
 
@@ -72,11 +71,16 @@ Example Claude Code configuration:
 
 Sessions: `start_session`, `get_next_card`, `submit_review`, `skip_card`, `adjust_session`, `end_session`, `resolve_leech`
 Cards: `create_card`, `get_card`, `update_card`, `delete_card`, `delete_cards`, `list_cards`, `search_cards`, `suspend_card`, `unsuspend_card`, `find_similar_cards`, `get_due_cards`
+Card notes: `list_card_notes`, `resolve_card_note`
 Decks & stats: `list_decks`, `get_deck_stats`, `delete_deck`, `get_stats`, `check_pressure`, `check_calibration`, `get_session_history`
 
 `check_pressure` is the single source of truth for due counts and the SRS pressure verdict (`ok`/`warn`/`pause`) across two axes: review backlog (due cards excluding state New) and cards added today. `create_card` is blocked while it reads pause; `inheritFrom` splits and `update_card` are always allowed, and splits are excluded from the intake axis via the `Card.inheritedFrom` column. The reported `clearance` covers the flashcards axis only, since reviewing cannot lower intake — only the start of the next day resets it. `.txt` import checks pressure once up front, so it is either refused whole or runs to completion.
 
 `check_calibration` answers whether the questions are at the right difficulty: true retention over the last 30 days (Anki's convention — reviews with `elapsedDays >= 1`, first review per card per **local** calendar day, rated 3 or better) against an 80-90% band, plus a `low-signal` verdict when there are fewer than 50 eligible reviews or more than 80% of ratings are Good. The same report is printed as JSON by `npm run dev:cli -- calibration`, which is what the study repo's `/study` skill reads.
+
+Schema changes need no step: every start of the CLI, the MCP server and the app server pushes `prisma/schema.prisma` to the database when it changed (backing the file up first), and refuses a change that would lose data.
+
+Card notes are what the developer noted about a card mid-study in Omvida (Ctrl+N), so the session goes on: an edit to make, or something to understand better. One per card, markdown, in the `CardNote` table and deleted with its card. A fix session started from the app reads them with `list_card_notes` and calls `resolve_card_note` once a note is handled.
 
 Leeches are enforced rather than listed. When `get_next_card` serves a card with 5+ lapses it stamps `Card.leechFlaggedAt` and returns a `leech` field; the next call errors until the card is rewritten (`update_card`, which also clears the flag and resets the lapse count), split (`create_card` with `inheritFrom`, then `delete_card`), deleted, or kept as-is with `resolve_leech(action: "defer")`. A deferred card is recorded in `Card.leechDeferredLapses` and flags again the next time it lapses.
 

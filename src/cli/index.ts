@@ -2,7 +2,7 @@
 
 import { Command } from "commander";
 import { createClient, setDb } from "../db/client.js";
-import { normalizeDates } from "../db/normalize.js";
+import { prepareDatabase } from "../db/prepare.js";
 import { createDeck, listDecks, getDeckStats, getDeckByName, getOrCreateDeck } from "../core/deck-service.js";
 import { parseTags } from "../core/types.js";
 import { createCard, searchCards, backfillEmbeddings, updateCard, CARD_STATE_BY_NAME } from "../core/card-service.js";
@@ -634,7 +634,20 @@ program
     console.log(`  Restored ${result.rows} rows across ${result.tables} table(s) from ${file} → ${target}`);
   });
 
+// --- db-sync ---
+// Every start already syncs the schema (prepareDatabase, below); this says
+// what that start did, and is how a script makes a database ready and
+// stamped without doing anything else (Omvida's fixture deck).
+let schemaPushed = false;
+program
+  .command("db-sync")
+  .description("Bring the database's tables up to prisma/schema.prisma (every start does this too)")
+  .action(() => {
+    console.log(schemaPushed ? "  Schema pushed (the old database was backed up beside it)" : "  Schema already in sync");
+  });
+
 // Run
-void normalizeDates(prisma)
+void prepareDatabase(prisma)
+  .then((r) => { schemaPushed = r.schemaPushed; })
   .then(() => program.parseAsync(process.argv))
   .then(() => prisma.$disconnect());

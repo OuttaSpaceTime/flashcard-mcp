@@ -1,4 +1,4 @@
-import type { Card as PrismaCard } from "@prisma/client";
+import type { Card as PrismaCard, CardNote } from "@prisma/client";
 import type { Grade } from "ts-fsrs";
 import { getDb } from "../db/client.js";
 import {
@@ -16,6 +16,8 @@ import { deferLeech, findUnresolvedLeeches, leechPayload } from "../core/leeches
 import { parseTags } from "../core/types.js";
 import { gradeAnswer, type ClaudeRunner } from "../core/grading.js";
 import { getOverview } from "./overview.js";
+import { recentSessions } from "./sessions.js";
+import { listCardNotes, setCardNote } from "../core/card-notes.js";
 import { localDay } from "../core/days.js";
 
 /**
@@ -69,6 +71,23 @@ export function toAppCard(card: PrismaCard, deckNames: Map<string, string>): App
     dueDay: localDay(card.due),
     suspended: card.suspended,
   };
+}
+
+/** A card note as the app gets it (card-notes.ts). */
+export function toAppNote(note: CardNote): { cardId: string; body: string; createdAt: string } {
+  return { cardId: note.cardId, body: note.body, createdAt: note.createdAt.toISOString() };
+}
+
+/** The stamp's notes part: count and newest edit of the card notes. */
+async function notesToken(): Promise<string> {
+  const n = await getDb().cardNote.aggregate({ _count: { _all: true }, _max: { updatedAt: true } });
+  return `${n._count._all}:${n._max.updatedAt?.getTime() ?? 0}`;
+}
+
+/** The stamp's reviews part: count and newest of the reviews. */
+async function reviewsToken(): Promise<string> {
+  const r = await getDb().review.aggregate({ _count: { _all: true }, _max: { reviewedAt: true } });
+  return `${r._count._all}:${r._max.reviewedAt?.getTime() ?? 0}`;
 }
 
 /** Deck id -> name. A handful of decks, so one query per call beats a join per card. */
@@ -182,6 +201,47 @@ export function createHandlers(deps: { runner?: ClaudeRunner } = {}): Record<str
       ]);
       return rows.map((c) => toAppCard(c, names));
     },
+
+    /**
+     * A token that changes whenever a card is created, edited or deleted, by
+     * this server or any other process on the same database (Claude Code's MCP
+     * server, the CLI). The app polls it to notice a card fixed in Claude Code
+     * without reloading the whole deck every few seconds. Count plus newest
+     * updatedAt: an edit moves the max (Prisma's @updatedAt), a delete moves
+     * the count. A review does not move it: it writes the card's scheduling
+     * and keeps its updatedAt (session-service.ts), so mid-session the app
+     * reloads the deck for a card fixed in Claude Code, not for every rating.
+     * Not `PRAGMA data_version`, which would skip our own writes but is per
+     * connection, and the Prisma adapter owns those.
+     *
+     * Reviews and card notes have tokens of their own, `reviews` and
+     * `notes`, made the same way. Reviews, from this app or a /study chat,
+     * move the due counts and the cards' scheduling, which the app reloads on
+     * its own terms. A fix session resolving a note (a delete) must show as
+     * surely as the card it fixed, and apart, so a note saved reloads only
+     * the notes.
+     */
+    stamp: async () => {
+      const [cards, reviews, notes] = await Promise.all([
+        getDb().card.aggregate({ _count: { _all: true }, _max: { updatedAt: true } }),
+        reviewsToken(),
+        notesToken(),
+      ]);
+      return { stamp: `${cards._count._all}:${cards._max.updatedAt?.getTime() ?? 0}`, reviews, notes };
+    },
+
+    /** Every open card note (card-notes.ts), oldest first. */
+    notes: async () => (await listCardNotes()).map(toAppNote),
+
+    /** Writes a card's note; an empty body deletes it. */
+    setNote: async (p) => {
+      const body = typeof p.body === "string" ? p.body : "";
+      const note = await setCardNote(str(p, "cardId"), body);
+      return note == null ? null : toAppNote(note);
+    },
+
+    /** Recent sessions with the cards each lapsed and noted (sessions.ts). */
+    sessions: async (p) => recentSessions(optNum(p, "limit") ?? 5),
 
     searchCards: async (p) => {
       const query = typeof p.query === "string" ? p.query.trim() : "";

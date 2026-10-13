@@ -50,6 +50,7 @@ model Card {
   createdAt  DateTime  @default(now())
   updatedAt  DateTime  @updatedAt
   reviews    Review[]
+  note       CardNote?
 
   @@index([deckId])
   @@index([due])
@@ -70,6 +71,20 @@ model Review {
 
   @@index([cardId])
   @@index([reviewedAt])
+}
+
+// What the developer wants done about a card, noted mid-study (Omvida's
+// Ctrl+N) so the session goes on: an edit to make, or something to understand
+// better. One per card, markdown, kept until a fix session resolves it
+// (src/core/card-notes.ts) and deleted with its card. A table rather than a
+// Card column: a note is not the card's content, and writing one must not move
+// Card.updatedAt, which every reader takes for an edit of the card.
+model CardNote {
+  cardId    String   @id
+  card      Card     @relation(fields: [cardId], references: [id], onDelete: Cascade)
+  body      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 model StudySession {

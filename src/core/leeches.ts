@@ -44,9 +44,11 @@ export async function flagLeechOnServe(card: PrismaCard): Promise<PrismaCard> {
   if (card.suspended || card.lapses < LEECH_LAPSES) return card;
   if (card.leechDeferredLapses != null && card.lapses <= card.leechDeferredLapses) return card;
 
+  // updatedAt stays, as for a review (session-service.ts): serving the card
+  // is not an edit of it.
   return getDb().card.update({
     where: { id: card.id },
-    data: { leechFlaggedAt: new Date() },
+    data: { leechFlaggedAt: new Date(), updatedAt: card.updatedAt },
   });
 }
 

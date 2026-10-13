@@ -4,7 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { createClient, setDb, getDb } from "../db/client.js";
-import { normalizeDates } from "../db/normalize.js";
+import { prepareDatabase } from "../db/prepare.js";
 import { listDecks, getDeckStats, deleteDeck } from "../core/deck-service.js";
 import { cardMaturity } from "../core/scheduler.js";
 import {
@@ -37,6 +37,7 @@ import {
 import { checkPressure } from "../core/pressure.js";
 import { checkCalibration } from "../core/calibration.js";
 import { deferLeech, leechPayload } from "../core/leeches.js";
+import { listCardNotes, resolveCardNote } from "../core/card-notes.js";
 import type { Grade } from "ts-fsrs";
 
 const prisma = createClient();
@@ -567,6 +568,40 @@ server.registerTool(
 );
 
 server.registerTool(
+  "list_card_notes",
+  {
+    description:
+      "List the open card notes, oldest first: what the developer noted about a card while studying (in the Omvida app), to handle later. A note is free markdown: an edit they want made to the card, something they want to understand better, or anything else. Each entry has the note and its card (id, deck, front, back, tags, lapses). Handle a note, then call resolve_card_note.",
+    inputSchema: {},
+  },
+  async () =>
+    j(
+      (await listCardNotes()).map((n) => ({
+        cardId: n.cardId,
+        note: n.body,
+        notedAt: n.createdAt.toISOString(),
+        deck: n.card.deck.name,
+        front: n.card.front,
+        back: n.card.back,
+        tags: parseTags(n.card.tags),
+        lapses: n.card.lapses,
+      }))
+    )
+);
+
+server.registerTool(
+  "resolve_card_note",
+  {
+    description:
+      "Resolve (delete) a card's note once it has been handled: the card fixed with update_card or split, or the question in it worked through with the developer. Only resolve a note the developer agrees is done. Returns resolved: false when the card has no note.",
+    inputSchema: {
+      cardId: z.string().describe("The card whose note is done"),
+    },
+  },
+  async (args) => j({ cardId: args.cardId, resolved: await resolveCardNote(args.cardId) })
+);
+
+server.registerTool(
   "get_session_history",
   {
     description:
@@ -607,7 +642,7 @@ server.registerTool(
 
 // Start server
 async function main() {
-  await normalizeDates(prisma);
+  await prepareDatabase(prisma);
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
