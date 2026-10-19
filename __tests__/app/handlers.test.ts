@@ -7,7 +7,7 @@ import { localDay } from "../../src/core/days.js";
 import { updateCard } from "../../src/core/card-service.js";
 import { createDeck } from "../../src/core/deck-service.js";
 import { getDb } from "../../src/db/client.js";
-import type { ClaudeRunner } from "../../src/core/grading.js";
+import type { ClaudeStarter } from "../../src/core/grading.js";
 
 let deckId: string;
 
@@ -37,14 +37,31 @@ async function seed(count: number, overrides: Partial<{ state: number; due: Date
   return out;
 }
 
-const fakeGrader: ClaudeRunner = async () => ({
-  code: 0,
-  stdout: JSON.stringify({ is_error: false, structured_output: { rating: 3, reason: "Correct.", quality_issue: "none" } }),
-  stderr: "",
-});
+const started: string[][] = [];
+let killed = 0;
+const fakeGrader: ClaudeStarter = (argv) => {
+  started.push(argv);
+  let sent = false;
+  return {
+    get exited() {
+      return sent;
+    },
+    send: async () => {
+      sent = true;
+      return {
+        code: 0,
+        stdout: JSON.stringify({ type: "result", is_error: false, structured_output: { rating: 3, reason: "Correct.", quality_issue: "none" } }),
+        stderr: "",
+      };
+    },
+    kill: () => {
+      if (!sent) killed++;
+    },
+  };
+};
 
 describe("app handlers", () => {
-  const h = createHandlers({ runner: fakeGrader });
+  const h = createHandlers({ starter: fakeGrader });
 
   beforeEach(async () => {
     deckId = (await createDeck("Web")).id;
@@ -213,10 +230,28 @@ describe("app handlers", () => {
     expect(out[1].noted).toEqual([b.id]);
   });
 
-  it("grades through the injected runner", async () => {
-    const [card] = await seed(1);
-    const g = (await h.grade({ cardId: card.id, answer: "Answer 1" })) as { rating: number; reason: string };
+  it("grades on the spare nextCard booted, keeps a spare across cards, and ends it with the session", async () => {
+    await seed(2, { state: State.Review });
+    const s = (await h.startSession({})) as { sessionId: string };
+    await h.nextCard({ sessionId: s.sessionId });
+    started.length = 0;
+    killed = 0;
+    const next = (await h.nextCard({ sessionId: s.sessionId })) as { card: { id: string } };
+    expect(started).toHaveLength(0);   // the spare from before is still up
+    const g = (await h.grade({ cardId: next.card.id, answer: "Answer 1" })) as { rating: number; reason: string };
     expect(g).toMatchObject({ rating: 3, reason: "Correct." });
+    expect(started).toHaveLength(1);   // the spare for the next grade
+    await h.nextCard({ sessionId: s.sessionId });
+    expect(killed).toBe(0);
+    await h.endSession({ sessionId: s.sessionId });
+    expect(killed).toBe(1);
+  });
+
+  it("refuses to grade an empty answer without starting claude", async () => {
+    const [card] = await seed(1);
+    started.length = 0;
+    await expect(h.grade({ cardId: card.id, answer: "  " })).rejects.toThrow(/empty/);
+    expect(started).toHaveLength(0);
   });
 
   it("rejects a rating outside 1-4", async () => {

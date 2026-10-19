@@ -14,7 +14,7 @@ import { checkPressure } from "../core/pressure.js";
 import { deleteCard, getCard, searchCards } from "../core/card-service.js";
 import { deferLeech, findUnresolvedLeeches, leechPayload } from "../core/leeches.js";
 import { parseTags } from "../core/types.js";
-import { gradeAnswer, type ClaudeRunner } from "../core/grading.js";
+import { Grader, type ClaudeStarter } from "../core/grading.js";
 import { getOverview } from "./overview.js";
 import { recentSessions } from "./sessions.js";
 import { listCardNotes, setCardNote } from "../core/card-notes.js";
@@ -35,6 +35,11 @@ import { localDay } from "../core/days.js";
  * - `nextCard` also carries `schedules`, what each rating 1-4 would schedule
  *   (submitReview's shape, keyed by rating), so the rating keys can say where
  *   they send the card. /study has no keys to label.
+ * - `grade` suggests a rating from `claude -p` (core/grading.ts), and the
+ *   session drives its processes: `nextCard` ends the last card's grade and
+ *   makes sure a spare claude is booted, `endSession` ends both. So a card
+ *   rated without waiting for Claude leaves no grade running, and the app has
+ *   no lifecycle of its own to keep.
  *
  * The app talks to one server for its whole life rather than running the CLI
  * per call: a start costs about a second, and session-service caches open
@@ -111,7 +116,8 @@ function optNum(params: Record<string, unknown>, key: string): number | undefine
 
 export type Handler = (params: Record<string, unknown>) => Promise<unknown>;
 
-export function createHandlers(deps: { runner?: ClaudeRunner } = {}): Record<string, Handler> {
+export function createHandlers(deps: { starter?: ClaudeStarter } = {}): Record<string, Handler> {
+  const grader = new Grader(deps.starter);
   return {
     overview: async (p) => getOverview({ pendingLimit: optNum(p, "pendingLimit") }),
 
@@ -131,8 +137,11 @@ export function createHandlers(deps: { runner?: ClaudeRunner } = {}): Record<str
       };
     },
 
+    // The last card's grade ends here (it was rated, skipped or deleted), and
+    // the spare is there for the new card's first grade.
     nextCard: async (p) => {
       const sessionId = str(p, "sessionId");
+      grader.endGrade();
       const leeches = await findUnresolvedLeeches();
       if (leeches.length > 0) {
         const blocked = leeches[0];
@@ -142,6 +151,7 @@ export function createHandlers(deps: { runner?: ClaudeRunner } = {}): Record<str
       if (card == null) return { done: true };
       const position = await getQueuePosition(sessionId);
       const leech = leechPayload(card);
+      grader.prepare();
       return {
         card: toAppCard(card, await deckNames()),
         position: position?.position ?? null,
@@ -152,12 +162,19 @@ export function createHandlers(deps: { runner?: ClaudeRunner } = {}): Record<str
       };
     },
 
+    // The process is claimed before the card lookup awaits, so overlapping
+    // grades keep the order they came in (Grader).
     grade: async (p) => {
       const cardId = str(p, "cardId");
-      const card = await getCard(cardId);
-      if (card == null) throw new Error(`Card not found: ${cardId}`);
       const answer = typeof p.answer === "string" ? p.answer : "";
-      return gradeAnswer({ front: card.front, back: card.back, answer }, deps.runner);
+      if (answer.trim() === "") throw new Error("nothing to grade: the answer is empty");
+      const proc = grader.claim();
+      const card = await getCard(cardId);
+      if (card == null) {
+        proc.kill();
+        throw new Error(`Card not found: ${cardId}`);
+      }
+      return grader.grade(proc, { front: card.front, back: card.back, answer });
     },
 
     review: async (p) => {
@@ -171,6 +188,7 @@ export function createHandlers(deps: { runner?: ClaudeRunner } = {}): Record<str
     skip: async (p) => ({ skipped: await skipCard(str(p, "sessionId")) }),
 
     endSession: async (p) => {
+      grader.close();
       const ended = await endSession(str(p, "sessionId"));
       if (ended == null) return null;
       return {

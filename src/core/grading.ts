@@ -18,6 +18,23 @@ import { spawn } from "node:child_process";
  * saved session. That keeps a grade to about three seconds, and stops the
  * grader from wandering into the wiki or the deck when the card back is all it
  * should judge against.
+ *
+ * About a second of those three is `claude` starting up, so the `Grader` keeps
+ * one booted ahead (a spare) for as long as a session is open, and the app
+ * grades while the developer pauses typing, so a grade is often done by the
+ * time they reveal. The spare holds nothing of a card (the prompt is all
+ * there is of one), so it lives from card to card: ending it with each card
+ * would only boot an identical one, a second of CPU per card.
+ * Each grade still gets a fresh process: sending a changed answer to the same
+ * conversation would save nothing on the model's side (it reads it all again)
+ * and would let the earlier draft and its verdict sway the rating. The spare
+ * takes its prompt as a stream-json message, because a plain-text `claude -p`
+ * gives up on stdin after three seconds and runs with no prompt.
+ *
+ * Measured and rejected (2026-10-19, 15 cards, Sonnet): `--effort low` changed
+ * neither the time nor the ratings (no thinking happens at the default), and
+ * asking for the JSON in the prompt instead of `--json-schema` saves the second
+ * turn but was slower overall (median 5.4s against 3.7s) and moved two ratings.
  */
 
 export const GRADE_MODEL = "sonnet";
@@ -59,8 +76,20 @@ export interface RunResult {
   stderr: string;
 }
 
-/** Runs `claude` with argv and stdin. Injected in tests. */
-export type ClaudeRunner = (argv: string[], stdin: string, timeoutMs: number) => Promise<RunResult>;
+/**
+ * A `claude` that has been started and waits for its one prompt. `send` writes
+ * the prompt and closes stdin, and resolves when the process exits; `kill`
+ * ends it, sent or not, and a pending `send` rejects. `exited` is true once the
+ * process is gone or killed: it can take no prompt.
+ */
+export interface ClaudeProcess {
+  send(stdin: string, timeoutMs: number): Promise<RunResult>;
+  kill(): void;
+  readonly exited: boolean;
+}
+
+/** Starts `claude` with argv. Injected in tests. */
+export type ClaudeStarter = (argv: string[]) => ClaudeProcess;
 
 export const GRADE_SCHEMA = {
   type: "object",
@@ -108,7 +137,9 @@ export function gradeArgv(): string[] {
   return [
     "-p",
     "--model", GRADE_MODEL,
-    "--output-format", "json",
+    "--input-format", "stream-json",
+    "--output-format", "stream-json",
+    "--verbose",
     "--json-schema", JSON.stringify(GRADE_SCHEMA),
     "--system-prompt", GRADE_SYSTEM_PROMPT,
     "--tools", "",
@@ -118,18 +149,39 @@ export function gradeArgv(): string[] {
   ];
 }
 
+/** The prompt as the one stream-json message the grader reads from stdin. */
+export function gradeMessage(input: GradeInput): string {
+  return JSON.stringify({ type: "user", message: { role: "user", content: buildGradePrompt(input) } }) + "\n";
+}
+
 /**
- * Reads claude's `--output-format json` envelope. The structured answer is in
- * `structured_output`; `result` carries the same object as a JSON string, used
- * as a fallback in case a CLI version leaves the first one out.
+ * The result envelope in claude's stream-json output: the last line of type
+ * "result", after the init and message lines.
  */
-export function parseGradeOutput(stdout: string): GradeSuggestion {
-  let envelope: Record<string, unknown>;
-  try {
-    envelope = JSON.parse(stdout) as Record<string, unknown>;
-  } catch {
-    throw new Error("grader returned no JSON");
+function resultEnvelope(stdout: string): Record<string, unknown> | null {
+  const lines = stdout.split("\n").filter((l) => l.trim() !== "");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let ev: unknown;
+    try {
+      ev = JSON.parse(lines[i]);
+    } catch {
+      continue;
+    }
+    if (ev == null || typeof ev !== "object" || Array.isArray(ev)) continue;
+    if ((ev as Record<string, unknown>).type === "result") return ev as Record<string, unknown>;
   }
+  return null;
+}
+
+/**
+ * Reads claude's result envelope. The structured answer is in
+ * `structured_output`; `result` carries the same object as a JSON string, used
+ * as a fallback in case a CLI version leaves the first one out. `noResult` is
+ * the error when there is no envelope at all (how claude exited, if it failed).
+ */
+export function parseGradeOutput(stdout: string, noResult = "grader returned no JSON"): GradeSuggestion {
+  const envelope = resultEnvelope(stdout);
+  if (envelope == null) throw new Error(noResult);
   if (envelope.is_error === true) {
     const msg = typeof envelope.result === "string" ? envelope.result : "unknown error";
     throw new Error(`grader failed: ${msg}`);
@@ -162,36 +214,114 @@ export function parseGradeOutput(stdout: string): GradeSuggestion {
   return { rating, reason, quality };
 }
 
-export const runClaude: ClaudeRunner = (argv, stdin, timeoutMs) =>
-  new Promise((resolve, reject) => {
-    const child = spawn("claude", argv, { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      reject(new Error(`grader timed out after ${Math.round(timeoutMs / 1000)}s`));
-    }, timeoutMs);
-    child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
-    child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      reject(new Error(`could not start claude: ${err.message}`));
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({ code, stdout, stderr });
-    });
-    child.stdin.end(stdin);
+export const startClaude = (argv: string[], command = "claude"): ClaudeProcess => {
+  const child = spawn(command, argv, { stdio: ["pipe", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  let exited = false;
+  let cancel: (err: Error) => void = () => {};
+  // The process's one outcome, settled by whichever comes first: its exit,
+  // a failure to start, or a kill. A spare killed unused has nobody waiting.
+  const done = new Promise<RunResult>((resolve, reject) => {
+    cancel = reject;
+    child.on("error", (err) => reject(new Error(`could not start claude: ${err.message}`)));
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
   });
+  done.catch(() => {});
+  child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
+  child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+  // `exit`, not `close`: close waits for the output too, which a child of the
+  // process can hold open after a kill.
+  child.on("exit", () => (exited = true));
+  child.on("error", () => (exited = true));
+  // Writing to a process that is already gone fails with EPIPE; that must not
+  // take the server down. `done` reports it instead.
+  child.stdin.on("error", () => {});
+  return {
+    get exited() {
+      return exited;
+    },
+    async send(stdin, timeoutMs) {
+      child.stdin.end(stdin);
+      let timer: NodeJS.Timeout | undefined;
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          child.kill("SIGTERM");
+          reject(new Error(`grader timed out after ${Math.round(timeoutMs / 1000)}s`));
+        }, timeoutMs);
+      });
+      try {
+        return await Promise.race([done, timeout]);
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+    kill() {
+      exited = true;
+      child.kill("SIGTERM");
+      cancel(new Error("grade cancelled"));
+    },
+  };
+};
 
-export async function gradeAnswer(input: GradeInput, runner: ClaudeRunner = runClaude): Promise<GradeSuggestion> {
-  if (input.answer.trim() === "") {
-    throw new Error("nothing to grade: the answer is empty");
+/**
+ * The app's grades: at most one running, and one spare `claude` booted and
+ * waiting for the next prompt while a session is open.
+ *
+ * The app grades while the developer types, so grades overlap: a newer answer
+ * ends the grade still running, since only the newest can be shown. A request
+ * claims its process as it arrives, before the handler awaits anything (the
+ * card lookup), so requests are ordered as they came: an older one that gets
+ * there late finds its process already killed. `endGrade()` ends the grade
+ * of a card that is done with; `close()` ends the spare too.
+ */
+export class Grader {
+  private spare: ClaudeProcess | null = null;
+  private running: ClaudeProcess | null = null;
+
+  constructor(private readonly start: ClaudeStarter = startClaude) {}
+
+  /** Boot a claude for the next grade, if none is waiting. */
+  prepare(): void {
+    if (this.spare == null || this.spare.exited) this.spare = this.start(gradeArgv());
   }
-  const result = await runner(gradeArgv(), buildGradePrompt(input), GRADE_TIMEOUT_MS);
-  if (result.code !== 0 && result.stdout.trim() === "") {
-    const firstLine = result.stderr.trim().split("\n")[0] ?? "";
-    throw new Error(`grader exited ${String(result.code)}${firstLine !== "" ? `: ${firstLine}` : ""}`);
+
+  /**
+   * Ends the grade still running and takes the spare (or a fresh claude when
+   * there is none) for a new one; another spare boots for the next grade.
+   */
+  claim(): ClaudeProcess {
+    this.running?.kill();
+    let proc = this.spare;
+    this.spare = null;
+    if (proc == null || proc.exited) proc = this.start(gradeArgv());
+    this.running = proc;
+    this.spare = this.start(gradeArgv());
+    return proc;
   }
-  return parseGradeOutput(result.stdout);
+
+  /** Grades `input` on a claimed process. */
+  async grade(proc: ClaudeProcess, input: GradeInput): Promise<GradeSuggestion> {
+    try {
+      const result = await proc.send(gradeMessage(input), GRADE_TIMEOUT_MS);
+      const firstLine = result.stderr.trim().split("\n")[0] ?? "";
+      const exit = `grader exited ${String(result.code)}${firstLine !== "" ? `: ${firstLine}` : ""}`;
+      return parseGradeOutput(result.stdout, result.code !== 0 ? exit : undefined);
+    } finally {
+      if (this.running === proc) this.running = null;
+    }
+  }
+
+  /** The card is done with: end its grade still running. */
+  endGrade(): void {
+    this.running?.kill();
+    this.running = null;
+  }
+
+  /** The session is over: end the grade still running and the spare. */
+  close(): void {
+    this.endGrade();
+    this.spare?.kill();
+    this.spare = null;
+  }
 }
