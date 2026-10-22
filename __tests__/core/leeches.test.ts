@@ -176,8 +176,7 @@ describe("leeches", () => {
       const session = await startSession();
       await getNextCard(session.id);
 
-      const deferred = await deferLeech(id);
-      expect(deferred.leechDeferredLapses).toBe(LEECH_LAPSES);
+      expect(await deferLeech(id)).toEqual({ cardId: id, deferredAtLapses: LEECH_LAPSES });
 
       await expect(getNextCard(session.id)).resolves.not.toThrow();
     });
@@ -193,7 +192,7 @@ describe("leeches", () => {
     });
 
     it("flags and blocks again after one more lapse", async () => {
-      const id = await seedCard(LEECH_LAPSES + 1, { leechDeferredLapses: LEECH_LAPSES });
+      await seedCard(LEECH_LAPSES + 1, { leechDeferredLapses: LEECH_LAPSES });
       const session = await startSession();
 
       const card = await getNextCard(session.id);

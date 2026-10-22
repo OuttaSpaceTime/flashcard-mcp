@@ -1,0 +1,22 @@
+{
+  "adapters": {
+    "js-debug-adapter": {
+      "command": "js-debug-adapter",
+      "languages": ["javascript", "typescript"],
+      "fileTypes": [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"],
+      "rootMarkers": ["package.json", "tsconfig.json"],
+      "launchDefaults": {
+        "request": "launch",
+        "type": "pwa-node",
+        "stopOnEntry": true,
+        "runtimeArgs": ["--import", "tsx"],
+        "skipFiles": ["<node_internals>/**", "**/node_modules/**"]
+      },
+      "attachDefaults": {
+        "request": "attach",
+        "type": "pwa-node",
+        "skipFiles": ["<node_internals>/**", "**/node_modules/**"]
+      }
+    }
+  }
+}

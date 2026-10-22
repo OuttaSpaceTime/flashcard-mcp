@@ -3,6 +3,7 @@ import {
   createDeck,
   listDecks,
   getDeckStats,
+  listDeckStats,
   deleteDeck,
 } from "../../src/core/deck-service.js";
 import { getDb } from "../../src/db/client.js";
@@ -150,6 +151,21 @@ describe("deck-service", () => {
     });
   });
 
+  describe("listDeckStats", () => {
+    it("gives every deck, by name, the same stats getDeckStats does", async () => {
+      const db = getDb();
+      const b = await createDeck("B");
+      const a = await createDeck("A");
+      await db.card.create({ data: { deckId: a.id, front: "Q1", back: "A1" } });
+      await db.card.create({ data: { deckId: b.id, front: "Q2", back: "A2", state: 2 } });
+      await db.card.create({ data: { deckId: b.id, front: "Q3", back: "A3", suspended: true } });
+
+      expect(await listDeckStats()).toEqual([await getDeckStats(a.id), await getDeckStats(b.id)]);
+      const [, statsB] = await listDeckStats();
+      expect(statsB).toMatchObject({ totalCards: 2, reviewCards: 1, newCards: 1, dueCards: 1 });
+    });
+  });
+
   describe("deleteDeck", () => {
     it("removes the deck", async () => {
       const deck = await createDeck("React");
@@ -167,18 +183,6 @@ describe("deck-service", () => {
       const result = await deleteDeck(deck.id);
       expect(result.deletedCards).toBe(2);
       expect(await db.card.count({ where: { deckId: deck.id } })).toBe(0);
-    });
-
-    it("tombstones every card it cascades away", async () => {
-      const deck = await createDeck("React");
-      const db = getDb();
-      const a = await db.card.create({ data: { deckId: deck.id, front: "Q1", back: "A1" } });
-      const b = await db.card.create({ data: { deckId: deck.id, front: "Q2", back: "A2" } });
-
-      await deleteDeck(deck.id);
-
-      const tombs = await db.deletedCard.findMany({ orderBy: { cardId: "asc" } });
-      expect(tombs.map((t) => t.cardId)).toEqual([a.id, b.id].sort());
     });
 
     it("throws when deck does not exist", async () => {

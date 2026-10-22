@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { createCard, deleteCard, deleteCards } from "../../src/core/card-service.js";
-import { createDeck } from "../../src/core/deck-service.js";
+import { createDeck, deleteDeck } from "../../src/core/deck-service.js";
 import { getDb } from "../../src/db/client.js";
 
 let deckId: string;
@@ -49,6 +49,20 @@ describe("deletion tombstones", () => {
 
   it("leaves no tombstone for a card that was never deleted", async () => {
     await seed("still here?");
+
+    expect(await tombstoned()).toEqual([]);
+  });
+
+  it("records every card a deck delete cascades away", async () => {
+    const ids = [await seed("first?"), await seed("second?")];
+
+    expect(await deleteDeck(deckId)).toEqual({ deletedCards: 2 });
+
+    expect(await tombstoned()).toEqual([...ids].sort());
+  });
+
+  it("writes none when the delete fails", async () => {
+    await expect(deleteCard("nonexistent-id")).rejects.toThrow();
 
     expect(await tombstoned()).toEqual([]);
   });

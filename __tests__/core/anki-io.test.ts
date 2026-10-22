@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import {
   exportToAnkiTxt,
+  exportCardsToAnkiTxt,
   parseAnkiTxt,
   importTxtNotes,
   type AnkiNote,
@@ -59,22 +60,8 @@ describe("anki-io", () => {
       expect(notes[1].tags).toEqual(["react", "hooks"]);
     });
 
-    it("parses guid from designated column", () => {
-      const txt = "#separator:tab\n#guid column:3\nWhat is JSX?\tA syntax ext\tabc-123\nWhat is a hook?\tA function\tdef-456";
-
-      const notes = parseAnkiTxt(txt);
-      expect(notes[0].guid).toBe("abc-123");
-      expect(notes[1].guid).toBe("def-456");
-    });
-
-    it("handles tags and guid columns together", () => {
-      const txt = "#separator:tab\n#tags column:3\n#guid column:4\nQ1\tA1\ttag1\tguid-1\nQ2\tA2\ttag2 tag3\tguid-2";
-
-      const notes = parseAnkiTxt(txt);
-      expect(notes[0].tags).toEqual(["tag1"]);
-      expect(notes[0].guid).toBe("guid-1");
-      expect(notes[1].tags).toEqual(["tag2", "tag3"]);
-      expect(notes[1].guid).toBe("guid-2");
+    it("leaves tags undefined when the file has no tags column", () => {
+      expect(parseAnkiTxt("Q1\tA1")[0].tags).toBeUndefined();
     });
 
     it("skips empty lines and comment lines", () => {
@@ -84,7 +71,24 @@ describe("anki-io", () => {
       expect(notes.length).toBe(2);
     });
 
-    it("handles html:true header (content unchanged)", () => {
+    it("strips CRLF line endings from every field", () => {
+      const txt = "#separator:tab\r\n#tags column:3\r\nQ1\tA1\ttag1\r\nQ2\tA2\ttag2\r\n";
+
+      const notes = parseAnkiTxt(txt);
+      expect(notes).toHaveLength(2);
+      expect(notes[0]).toEqual({ front: "Q1", back: "A1", tags: ["tag1"] });
+      expect(notes[1].back).toBe("A2");
+    });
+
+    it("keeps blank lines and # lines inside a quoted field", () => {
+      const txt = 'Q1\t"<pre>a\n\n# not a comment\nb</pre>"\nQ2\tA2';
+
+      const notes = parseAnkiTxt(txt);
+      expect(notes).toHaveLength(2);
+      expect(notes[0].back).toBe("<pre>a\n\n# not a comment\nb</pre>");
+    });
+
+    it("leaves html fields as they are", () => {
       const txt = "#html:true\nWhat is <b>JSX</b>?\tA <i>syntax</i> extension";
 
       const notes = parseAnkiTxt(txt);
@@ -125,19 +129,6 @@ describe("anki-io", () => {
       expect(notes[0].deck).toBe("My Deck");
     });
 
-    it("handles #notetype header", () => {
-      const txt = "#separator:tab\n#notetype:Basic\nQ1\tA1";
-      const notes = parseAnkiTxt(txt);
-      expect(notes[0].notetype).toBe("Basic");
-    });
-
-    it("parses #notetype column header", () => {
-      const txt = "#separator:tab\n#notetype column:3\nQ1\tA1\tBasic\nQ2\tA2\tCloze";
-      const notes = parseAnkiTxt(txt);
-      expect(notes[0].notetype).toBe("Basic");
-      expect(notes[1].notetype).toBe("Cloze");
-    });
-
     it("parses #deck column header", () => {
       const txt = "#separator:tab\n#deck column:3\nQ1\tA1\tReact\nQ2\tA2\tTypeScript";
       const notes = parseAnkiTxt(txt);
@@ -148,42 +139,43 @@ describe("anki-io", () => {
 
   // --- Export ---
 
-  describe("exportToAnkiTxt", () => {
+  describe("exportCardsToAnkiTxt", () => {
     it("exports cards as tab-separated text with headers", async () => {
       await createCard({ deckId, front: "What is JSX?", back: "A syntax extension", tags: ["react"] });
       await createCard({ deckId, front: "What is a hook?", back: "A function", tags: ["react", "hooks"] });
 
-      const db = getDb();
-      const cards = await db.card.findMany({
-        include: { deck: { select: { name: true } } },
-      });
+      const { cardCount, content } = await exportCardsToAnkiTxt();
 
-      const txt = exportToAnkiTxt(
-        cards.map((c) => ({
-          front: c.front,
-          back: c.back,
-          tags: c.tags ? c.tags.split(",").filter(Boolean) : [],
-          guid: c.id,
-          deck: c.deck.name,
-        }))
-      );
-
-      expect(txt).toContain("#separator:tab");
-      expect(txt).toContain("#html:true");
-      expect(txt).toContain("#tags column:3");
-      expect(txt).toContain("#guid column:4");
-      expect(txt).toContain("#deck column:5");
-      expect(txt).toContain("What is JSX?\tA syntax extension\treact\t");
-      expect(txt).toContain("What is a hook?\tA function\treact hooks\t");
+      expect(cardCount).toBe(2);
+      expect(content).toContain("#separator:tab");
+      expect(content).toContain("#html:true");
+      expect(content).toContain("#tags column:3");
+      expect(content).toContain("#guid column:4");
+      expect(content).toContain("#deck column:5");
+      expect(content).toContain("What is JSX?\tA syntax extension\treact\t");
+      expect(content).toContain("What is a hook?\tA function\treact hooks\t");
     });
 
+    it("exports only the given deck", async () => {
+      const other = await createDeck("Other");
+      await createCard({ deckId, front: "Q1", back: "A1" });
+      await createCard({ deckId: other.id, front: "Q2", back: "A2" });
+
+      const { cardCount, content } = await exportCardsToAnkiTxt(other.id);
+      expect(cardCount).toBe(1);
+      expect(content).toContain("Q2\tA2");
+      expect(content).not.toContain("Q1");
+    });
+  });
+
+  describe("exportToAnkiTxt", () => {
     it("handles empty tags", async () => {
       const notes: AnkiNote[] = [
         { front: "Q", back: "A", tags: [] },
       ];
 
       const txt = exportToAnkiTxt(notes);
-      const lines = txt.split("\n").filter((l) => !l.startsWith("#") && l.trim());
+      const lines = txt.split("\n").filter((l) => !l.startsWith("#") && l.trim() !== "");
       expect(lines.length).toBe(1);
       // Tags column should be empty
       const fields = lines[0].split("\t");
@@ -198,80 +190,132 @@ describe("anki-io", () => {
       ];
 
       const txt = exportToAnkiTxt(notes);
-      const dataLines = txt.split("\n").filter((l) => !l.startsWith("#") && l.trim());
+      const dataLines = txt.split("\n").filter((l) => !l.startsWith("#") && l.trim() !== "");
       // Quoted fields should contain the raw content
       expect(dataLines[0]).toContain('"');
     });
 
-    it("round-trips through export then import", async () => {
+    it("round-trips through export then parse", async () => {
       const original: AnkiNote[] = [
         { front: "What is React?", back: "A UI library", tags: ["react", "fundamentals"], guid: "guid-1", deck: "React" },
         { front: "What is JSX?", back: "Syntax extension", tags: ["react"], guid: "guid-2", deck: "React" },
       ];
 
-      const exported = exportToAnkiTxt(original);
-      const imported = parseAnkiTxt(exported);
+      const imported = parseAnkiTxt(exportToAnkiTxt(original));
 
-      expect(imported.length).toBe(2);
-      expect(imported[0].front).toBe("What is React?");
-      expect(imported[0].back).toBe("A UI library");
-      expect(imported[0].tags).toEqual(["react", "fundamentals"]);
-      expect(imported[0].guid).toBe("guid-1");
-      expect(imported[0].deck).toBe("React");
-      expect(imported[1].front).toBe("What is JSX?");
-      expect(imported[1].guid).toBe("guid-2");
+      expect(imported).toEqual([
+        { front: "What is React?", back: "A UI library", tags: ["react", "fundamentals"], deck: "React" },
+        { front: "What is JSX?", back: "Syntax extension", tags: ["react"], deck: "React" },
+      ]);
     });
   });
 
   // --- importTxtNotes ---
 
   describe("importTxtNotes", () => {
+    it("round-trips a deck through export and import into an empty database", async () => {
+      await createCard({ deckId, front: "What is JSX?", back: "A syntax extension", tags: ["react"] });
+      await createCard({ deckId, front: "What is a hook?", back: "A function", tags: ["react", "hooks"] });
+      const { content } = await exportCardsToAnkiTxt();
+      await getDb().card.deleteMany();
+
+      // No --deck: each note goes to the deck its file names.
+      const result = await importTxtNotes(parseAnkiTxt(content));
+
+      expect(result).toEqual({ created: 2, updated: 0, duplicates: 0, invalid: 0 });
+      const cards = await getDb().card.findMany({ where: { deckId }, orderBy: { front: "asc" } });
+      expect(cards.map((c) => [c.front, c.back, c.tags])).toEqual([
+        ["What is JSX?", "A syntax extension", "react"],
+        ["What is a hook?", "A function", "react,hooks"],
+      ]);
+    });
+
+    it("refuses notes that name no deck when none is given, writing nothing", async () => {
+      await expect(importTxtNotes(parseAnkiTxt("Q1\tA1"))).rejects.toThrow(/name no deck/);
+      expect(await getDb().card.count()).toBe(0);
+    });
+
     it("skips duplicates by default", async () => {
       await createCard({ deckId, front: "What is JSX?", back: "Old answer" });
       const notes = parseAnkiTxt("What is JSX?\tNew answer\nNew card\tSome answer");
-      const result = await importTxtNotes(notes, deckId, {});
-      expect(result.created).toBe(1);
-      expect(result.duplicates).toBe(1);
-      const db = getDb();
-      const card = await db.card.findFirstOrThrow({ where: { deckId, front: "What is JSX?" } });
+      const result = await importTxtNotes(notes, { deck: "React" });
+      expect(result).toEqual({ created: 1, updated: 0, duplicates: 1, invalid: 0 });
+      const card = await getDb().card.findFirstOrThrow({ where: { deckId, front: "What is JSX?" } });
       expect(card.back).toBe("Old answer");
     });
 
     it("skips duplicates with conflict: ours", async () => {
       await createCard({ deckId, front: "What is JSX?", back: "Old answer" });
       const notes = parseAnkiTxt("What is JSX?\tNew answer");
-      const result = await importTxtNotes(notes, deckId, { conflict: "ours" });
+      const result = await importTxtNotes(notes, { deck: "React", conflict: "ours" });
       expect(result.duplicates).toBe(1);
-      const db = getDb();
-      const card = await db.card.findFirstOrThrow({ where: { deckId, front: "What is JSX?" } });
+      const card = await getDb().card.findFirstOrThrow({ where: { deckId, front: "What is JSX?" } });
       expect(card.back).toBe("Old answer");
     });
 
     it("overwrites back and tags with conflict: theirs", async () => {
       await createCard({ deckId, front: "What is JSX?", back: "Old answer", tags: ["old"] });
       const notes = parseAnkiTxt("#separator:tab\n#tags column:3\nWhat is JSX?\tNew answer\tnew-tag");
-      const result = await importTxtNotes(notes, deckId, { conflict: "theirs" });
+      const result = await importTxtNotes(notes, { deck: "React", conflict: "theirs" });
       expect(result.updated).toBe(1);
       expect(result.duplicates).toBe(0);
-      const db = getDb();
-      const card = await db.card.findFirstOrThrow({ where: { deckId, front: "What is JSX?" } });
+      const card = await getDb().card.findFirstOrThrow({ where: { deckId, front: "What is JSX?" } });
       expect(card.back).toBe("New answer");
       expect(card.tags).toBe("new-tag");
+    });
+
+    it("keeps a card's tags when the file has no tags column (conflict: theirs)", async () => {
+      await createCard({ deckId, front: "What is JSX?", back: "Old answer", tags: ["keep"] });
+      await importTxtNotes(parseAnkiTxt("What is JSX?\tNew answer"), { deck: "React", conflict: "theirs" });
+      const card = await getDb().card.findFirstOrThrow({ where: { deckId, front: "What is JSX?" } });
+      expect(card.back).toBe("New answer");
+      expect(card.tags).toBe("keep");
+    });
+
+    it("clears a leech flag on an overwritten card (conflict: theirs)", async () => {
+      const { card } = await createCard({ deckId, front: "What is JSX?", back: "Old answer" });
+      await getDb().card.update({ where: { id: card.id }, data: { lapses: 6, leechFlaggedAt: new Date() } });
+
+      await importTxtNotes(parseAnkiTxt("What is JSX?\tNew answer"), { deck: "React", conflict: "theirs" });
+
+      const after = await getDb().card.findUniqueOrThrow({ where: { id: card.id } });
+      expect(after.leechFlaggedAt).toBeNull();
+      expect(after.lapses).toBe(0);
     });
 
     it("dry-run with conflict: theirs counts but does not update", async () => {
       await createCard({ deckId, front: "What is JSX?", back: "Old answer" });
       const notes = parseAnkiTxt("What is JSX?\tNew answer");
-      const result = await importTxtNotes(notes, deckId, { conflict: "theirs", dryRun: true });
+      const result = await importTxtNotes(notes, { deck: "React", conflict: "theirs", dryRun: true });
       expect(result.updated).toBe(1);
-      const db = getDb();
-      const card = await db.card.findFirstOrThrow({ where: { deckId, front: "What is JSX?" } });
+      const card = await getDb().card.findFirstOrThrow({ where: { deckId, front: "What is JSX?" } });
       expect(card.back).toBe("Old answer");
+    });
+
+    it("dry-run into a deck that does not exist creates no deck", async () => {
+      const result = await importTxtNotes(parseAnkiTxt("Q1\tA1"), { deck: "Fresh", dryRun: true });
+      expect(result.created).toBe(1);
+      expect(await getDb().deck.count({ where: { name: "Fresh" } })).toBe(0);
+    });
+
+    it("creates a repeated front once and counts the repeat as a duplicate", async () => {
+      const result = await importTxtNotes(parseAnkiTxt("Q1\tA1\nQ1\tA2"), { deck: "React" });
+      expect(result).toEqual({ created: 1, updated: 0, duplicates: 1, invalid: 0 });
+      const cards = await getDb().card.findMany({ where: { deckId } });
+      expect(cards.map((c) => c.back)).toEqual(["A1"]);
+    });
+
+    it("counts empty fronts and rule-breaking content as invalid and imports the rest", async () => {
+      const notes = parseAnkiTxt("\tno front\nUses **markdown**\tA1\nQ2\tA2");
+      const result = await importTxtNotes(notes, { deck: "React" });
+      expect(result).toEqual({ created: 1, updated: 0, duplicates: 0, invalid: 2 });
+      const cards = await getDb().card.findMany({ where: { deckId } });
+      expect(cards.map((c) => c.front)).toEqual(["Q2"]);
     });
 
     it("imports more notes than the intake threshold in one run", async () => {
       const txt = Array.from({ length: PAUSE_NEW_TODAY + 5 }, (_, i) => `Q${i}\tA${i}`).join("\n");
-      const result = await importTxtNotes(parseAnkiTxt(txt), deckId, {});
+      const result = await importTxtNotes(parseAnkiTxt(txt), { deck: "React" });
 
       expect(result.created).toBe(PAUSE_NEW_TODAY + 5);
       expect(await getDb().card.count({ where: { deckId } })).toBe(PAUSE_NEW_TODAY + 5);
@@ -288,7 +332,7 @@ describe("anki-io", () => {
       });
 
       const notes = parseAnkiTxt("Q1\tA1\nQ2\tA2\nQ3\tA3");
-      await expect(importTxtNotes(notes, deckId, {})).rejects.toThrow(/cards added today/);
+      await expect(importTxtNotes(notes, { deck: "React" })).rejects.toThrow(/cards added today/);
 
       expect(await db.card.count({ where: { front: { startsWith: "Q" } } })).toBe(0);
     });
@@ -307,7 +351,7 @@ describe("anki-io", () => {
       });
 
       const notes = parseAnkiTxt("Q1\tA1\nQ2\tA2\nQ3\tA3");
-      await expect(importTxtNotes(notes, deckId, {})).rejects.toThrow(/Card creation blocked/);
+      await expect(importTxtNotes(notes, { deck: "React" })).rejects.toThrow(/Card creation blocked/);
 
       expect(await db.card.count({ where: { front: { startsWith: "Q" } } })).toBe(0);
     });
@@ -322,49 +366,19 @@ describe("anki-io", () => {
       });
 
       const notes = parseAnkiTxt("Q1\tA1");
-      await expect(importTxtNotes(notes, deckId, { dryRun: true })).rejects.toThrow(
+      await expect(importTxtNotes(notes, { deck: "React", dryRun: true })).rejects.toThrow(
         /Card creation blocked/
       );
     });
-  });
 
-  // --- Full import workflow ---
-
-  describe("import workflow (parse → deduplicate → create)", () => {
-    it("imports notes into a deck, skipping duplicates", async () => {
-      // Pre-existing card
-      await createCard({ deckId, front: "What is JSX?", back: "Old answer" });
-
-      const txt = "What is JSX?\tNew answer\nWhat is a hook?\tA function";
-      const notes = parseAnkiTxt(txt);
-
+    it("updates at pause, since overwriting adds no card", async () => {
       const db = getDb();
-      let created = 0;
-      let skipped = 0;
+      await db.card.createMany({
+        data: Array.from({ length: PAUSE_NEW_TODAY }, (_, i) => ({ deckId, front: `today ${i}`, back: "a" })),
+      });
 
-      for (const note of notes) {
-        const existing = await db.card.findFirst({
-          where: { deckId, front: note.front },
-        });
-
-        if (existing) {
-          skipped++;
-        } else {
-          await createCard({
-            deckId,
-            front: note.front,
-            back: note.back,
-            tags: note.tags,
-          });
-          created++;
-        }
-      }
-
-      expect(created).toBe(1);
-      expect(skipped).toBe(1);
-
-      const allCards = await db.card.findMany({ where: { deckId } });
-      expect(allCards.length).toBe(2);
+      const result = await importTxtNotes(parseAnkiTxt("today 0\tb"), { deck: "React", conflict: "theirs" });
+      expect(result.updated).toBe(1);
     });
   });
 });

@@ -21,6 +21,10 @@ describe("validateCardContent", () => {
     expect(validateCardContent(text)).toEqual([]);
   });
 
+  it("accepts newlines in an upper-case PRE block", () => {
+    expect(validateCardContent("Example:<PRE>a\nb</PRE>")).toEqual([]);
+  });
+
   it("rejects em dashes with two-sentence advice", () => {
     const violations = validateCardContent("Tokens expire — revocation needs state.");
     expect(violations).toHaveLength(1);

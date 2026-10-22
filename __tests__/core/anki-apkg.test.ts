@@ -1,22 +1,69 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "fs";
+import { mkdtempSync, readFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
+import Database from "better-sqlite3";
+import AdmZip from "adm-zip";
 import {
   exportToApkg,
-  importFromApkg,
-  importApkgCards,
+  exportCardsToApkg,
+  readApkg,
+  importApkgFile,
+  isApkgPath,
   convertSM2toFSRS,
   convertFSRStoSM2,
 } from "../../src/core/anki-apkg.js";
 import { createDeck } from "../../src/core/deck-service.js";
-import { createCard } from "../../src/core/card-service.js";
+import { createCard, suspendCard } from "../../src/core/card-service.js";
 import { getDb } from "../../src/db/client.js";
 import { State, Rating } from "ts-fsrs";
 import { submitReview, startSession, getNextCard } from "../../src/core/session-service.js";
 
 let deckId: string;
 let tempDir: string;
+
+const DAY_MS = 86_400_000;
+
+/** A card as Anki stores it, for packages built by hand. */
+interface AnkiCard {
+  front: string;
+  type: number;
+  queue: number;
+  due: number;
+  ivl?: number;
+  factor?: number;
+  reps?: number;
+  lapses?: number;
+  data?: string;
+  /** [revlog id (ms), ease] per review. */
+  revlog?: Array<[number, number]>;
+}
+
+/** Write a minimal Anki 2.1 package (schema v11) holding one deck. */
+function writeAnkiPackage(path: string, crt: number, cards: AnkiCard[]): void {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE col (crt integer, decks text);
+    CREATE TABLE notes (id integer PRIMARY KEY, tags text, flds text);
+    CREATE TABLE cards (id integer PRIMARY KEY, nid integer, did integer, type integer, queue integer, due integer, ivl integer, factor integer, reps integer, lapses integer, data text);
+    CREATE TABLE revlog (id integer PRIMARY KEY, cid integer, ease integer, time integer);
+  `);
+  db.prepare("INSERT INTO col VALUES (?, ?)").run(crt, JSON.stringify({ "7": { id: 7, name: "Anki" } }));
+  cards.forEach((c, i) => {
+    const id = i + 1;
+    db.prepare("INSERT INTO notes VALUES (?, '', ?)").run(id, `${c.front}\x1fAnswer ${id}`);
+    db.prepare("INSERT INTO cards VALUES (?, ?, 7, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+      id, id, c.type, c.queue, c.due, c.ivl ?? 0, c.factor ?? 0, c.reps ?? 0, c.lapses ?? 0, c.data ?? ""
+    );
+    for (const [revId, ease] of c.revlog ?? []) {
+      db.prepare("INSERT INTO revlog VALUES (?, ?, ?, 1000)").run(revId, id, ease);
+    }
+  });
+  const zip = new AdmZip();
+  zip.addFile("collection.anki21", Buffer.from(db.serialize()));
+  db.close();
+  zip.writeZip(path);
+}
 
 describe("anki-apkg", () => {
   beforeEach(async () => {
@@ -25,363 +72,233 @@ describe("anki-apkg", () => {
     tempDir = mkdtempSync(join(tmpdir(), "apkg-test-"));
   });
 
+  it("isApkgPath accepts deck and collection packages only", () => {
+    expect(isApkgPath("a.apkg")).toBe(true);
+    expect(isApkgPath("a.COLPKG")).toBe(true);
+    expect(isApkgPath("a.txt")).toBe(false);
+  });
+
   describe("convertSM2toFSRS", () => {
-    it("converts a review card with typical SM-2 values", () => {
-      const result = convertSM2toFSRS({
-        ivl: 30,
-        factor: 2500,
-        type: 2, // review
-        reps: 10,
-        lapses: 1,
-        due: 19500, // days since epoch
-      });
+    it("takes stability from the interval and difficulty from the ease", () => {
+      const result = convertSM2toFSRS({ ivl: 30, factor: 2500, reps: 10 });
 
       expect(result.stability).toBe(30);
       expect(result.difficulty).toBeGreaterThan(0);
       expect(result.difficulty).toBeLessThan(10);
-      expect(result.state).toBe(State.Review);
-      expect(result.reps).toBe(10);
-      expect(result.lapses).toBe(1);
     });
 
-    it("converts a new card", () => {
-      const result = convertSM2toFSRS({
-        ivl: 0,
-        factor: 0,
-        type: 0, // new
-        reps: 0,
-        lapses: 0,
-        due: 0,
-      });
-
-      expect(result.state).toBe(State.New);
-      expect(result.reps).toBe(0);
+    it("gives a new card no stability and middling difficulty", () => {
+      expect(convertSM2toFSRS({ ivl: 0, factor: 0, reps: 0 })).toEqual({ stability: 0, difficulty: 5 });
     });
 
-    it("converts a learning card", () => {
-      const result = convertSM2toFSRS({
-        ivl: 0,
-        factor: 0,
-        type: 1, // learning
-        reps: 2,
-        lapses: 0,
-        due: Math.floor(Date.now() / 1000),
-      });
-
-      expect(result.state).toBe(State.Learning);
+    it("gives a seen learning card a small positive stability", () => {
+      expect(convertSM2toFSRS({ ivl: 0, factor: 0, reps: 2 }).stability).toBe(1);
     });
 
     it("clamps difficulty to valid range", () => {
-      // Very high ease factor
-      const easy = convertSM2toFSRS({
-        ivl: 30,
-        factor: 5000,
-        type: 2,
-        reps: 5,
-        lapses: 0,
-        due: 19500,
-      });
-      expect(easy.difficulty).toBeGreaterThanOrEqual(1);
-
-      // Very low ease factor
-      const hard = convertSM2toFSRS({
-        ivl: 30,
-        factor: 1300,
-        type: 2,
-        reps: 5,
-        lapses: 3,
-        due: 19500,
-      });
-      expect(hard.difficulty).toBeLessThanOrEqual(10);
+      expect(convertSM2toFSRS({ ivl: 30, factor: 5000, reps: 5 }).difficulty).toBeGreaterThanOrEqual(1);
+      expect(convertSM2toFSRS({ ivl: 30, factor: 1300, reps: 5 }).difficulty).toBeLessThanOrEqual(10);
     });
   });
 
   describe("convertFSRStoSM2", () => {
     it("converts FSRS fields to SM-2 equivalents", () => {
       const result = convertFSRStoSM2({
-        stability: 30,
         difficulty: 5,
         state: State.Review,
-        reps: 10,
-        lapses: 1,
         due: new Date("2026-04-15"),
         interval: 30,
+        suspended: false,
       });
 
       expect(result.ivl).toBe(30);
       expect(result.factor).toBeGreaterThan(1000);
       expect(result.factor).toBeLessThanOrEqual(5000);
       expect(result.type).toBe(2); // review
-      expect(result.reps).toBe(10);
-      expect(result.lapses).toBe(1);
+      expect(result.queue).toBe(2);
     });
 
     it("converts new card state", () => {
       const result = convertFSRStoSM2({
-        stability: 0,
         difficulty: 0,
         state: State.New,
-        reps: 0,
-        lapses: 0,
         due: new Date(),
         interval: 0,
+        suspended: false,
       });
 
       expect(result.type).toBe(0);
       expect(result.queue).toBe(0);
+      expect(result.factor).toBe(0);
+    });
+
+    it("writes relearning cards to the intraday queue, due in epoch seconds", () => {
+      const due = new Date("2026-04-15T10:00:00Z");
+      const result = convertFSRStoSM2({ difficulty: 5, state: State.Relearning, due, interval: 0, suspended: false });
+
+      expect(result.type).toBe(3);
+      expect(result.queue).toBe(1);
+      expect(result.due).toBe(due.getTime() / 1000);
+    });
+
+    it("puts suspended cards in Anki's suspended queue", () => {
+      const result = convertFSRStoSM2({ difficulty: 5, state: State.Review, due: new Date(), interval: 3, suspended: true });
+      expect(result.type).toBe(2);
+      expect(result.queue).toBe(-1);
     });
   });
 
-  describe("exportToApkg", () => {
-    it("creates a valid .apkg file from cards", async () => {
-      await createCard({ deckId, front: "What is JSX?", back: "A syntax extension", tags: ["react"] });
-      await createCard({ deckId, front: "What is useState?", back: "A React hook", tags: ["react", "hooks"] });
-
-      const db = getDb();
-      const cards = await db.card.findMany({
-        include: { deck: true, reviews: true },
-      });
-
-      const outPath = join(tempDir, "test.apkg");
-      await exportToApkg(outPath, [
-        {
-          deckName: "React",
-          cards: cards.map((c) => ({
-            id: c.id,
-            front: c.front,
-            back: c.back,
-            tags: c.tags ? c.tags.split(",").filter(Boolean) : [],
-            stability: c.stability,
-            difficulty: c.difficulty,
-            state: c.state,
-            reps: c.reps,
-            lapses: c.lapses,
-            due: c.due,
-            interval: c.interval,
-            reviews: c.reviews.map((r) => ({
-              rating: r.rating,
-              reviewedAt: r.reviewedAt,
-              responseMs: r.responseMs ?? 0,
-              stability: r.stability,
-              difficulty: r.difficulty,
-            })),
-          })),
-        },
-      ]);
-
-      // Verify file exists and is a valid ZIP
-      const fileBuffer = readFileSync(outPath);
-      expect(fileBuffer.length).toBeGreaterThan(0);
-      // ZIP magic bytes: PK (50 4B)
-      expect(fileBuffer[0]).toBe(0x50);
-      expect(fileBuffer[1]).toBe(0x4b);
-    });
-
-    it("exports multiple decks", async () => {
-      const db = getDb();
+  describe("exportCardsToApkg", () => {
+    it("writes a ZIP with every deck that has cards", async () => {
       const deck2 = await createDeck("TypeScript");
-
+      await createDeck("Empty");
       await createCard({ deckId, front: "Q1", back: "A1" });
       await createCard({ deckId: deck2.id, front: "Q2", back: "A2" });
 
-      const cardsReact = await db.card.findMany({
-        where: { deckId },
-        include: { deck: true, reviews: true },
-      });
-      const cardsTS = await db.card.findMany({
-        where: { deckId: deck2.id },
-        include: { deck: true, reviews: true },
-      });
-
       const outPath = join(tempDir, "multi.apkg");
-      await exportToApkg(outPath, [
-        {
-          deckName: "React",
-          cards: cardsReact.map((c) => ({
-            id: c.id,
-            front: c.front,
-            back: c.back,
-            tags: [],
-            stability: c.stability,
-            difficulty: c.difficulty,
-            state: c.state,
-            reps: c.reps,
-            lapses: c.lapses,
-            due: c.due,
-            interval: c.interval,
-            reviews: [],
-          })),
-        },
-        {
-          deckName: "TypeScript",
-          cards: cardsTS.map((c) => ({
-            id: c.id,
-            front: c.front,
-            back: c.back,
-            tags: [],
-            stability: c.stability,
-            difficulty: c.difficulty,
-            state: c.state,
-            reps: c.reps,
-            lapses: c.lapses,
-            due: c.due,
-            interval: c.interval,
-            reviews: [],
-          })),
-        },
-      ]);
+      const result = await exportCardsToApkg(outPath);
 
+      expect(result).toEqual({ cardCount: 2, deckCount: 2 });
       const buf = readFileSync(outPath);
-      expect(buf[0]).toBe(0x50); // valid ZIP
+      expect(buf[0]).toBe(0x50); // ZIP magic: PK
+      expect(buf[1]).toBe(0x4b);
+      expect(readApkg(outPath).map((d) => d.name).sort()).toEqual(["React", "TypeScript"]);
+    });
+
+    it("exports only the given deck", async () => {
+      const deck2 = await createDeck("TypeScript");
+      await createCard({ deckId, front: "Q1", back: "A1" });
+      await createCard({ deckId: deck2.id, front: "Q2", back: "A2" });
+
+      const outPath = join(tempDir, "one.apkg");
+      expect(await exportCardsToApkg(outPath, deck2.id)).toEqual({ cardCount: 1, deckCount: 1 });
+      expect(readApkg(outPath)[0].items.map((c) => c.front)).toEqual(["Q2"]);
+    });
+
+    it("writes two reviews in the same millisecond without a revlog id clash", async () => {
+      const outPath = join(tempDir, "same-ms.apkg");
+      const reviewedAt = new Date("2026-01-01T00:00:00Z");
+      const review = { rating: Rating.Good, reviewedAt, responseMs: 1000, stability: 3, difficulty: 5 };
+      await exportToApkg(outPath, [{
+        deckName: "React",
+        cards: [{
+          id: "same-ms",
+          front: "Q",
+          back: "A",
+          tags: [],
+          schedule: {
+            stability: 3, difficulty: 5, state: State.Review, reps: 2, lapses: 0,
+            due: new Date(), interval: 3, lastReview: reviewedAt, suspended: false,
+          },
+          reviews: [review, review],
+        }],
+      }]);
+
+      const reviews = readApkg(outPath)[0].items[0].reviews;
+      expect(reviews.map((r) => r.reviewedAt.getTime())).toEqual([reviewedAt.getTime(), reviewedAt.getTime() + 1]);
     });
   });
 
-  describe("importFromApkg", () => {
-    it("round-trips export then import preserving deck structure and cards", async () => {
+  describe("round trip", () => {
+    it("restores cards, schedules, suspension and history into an empty database", async () => {
       await createCard({ deckId, front: "What is JSX?", back: "A syntax extension", tags: ["react"] });
-      await createCard({ deckId, front: "What is useState?", back: "A React hook", tags: ["hooks"] });
-
-      const db = getDb();
-      const cards = await db.card.findMany({
-        include: { deck: true, reviews: true },
-      });
+      const { card: kept } = await createCard({ deckId, front: "What is useState?", back: "A React hook" });
+      const session = await startSession();
+      const served = await getNextCard(session.id);
+      await submitReview(session.id, served!.id, Rating.Good, 1500);
+      await suspendCard(kept.id);
+      const before = await getDb().card.findMany({ orderBy: { front: "asc" } });
 
       const outPath = join(tempDir, "roundtrip.apkg");
-      await exportToApkg(outPath, [
-        {
-          deckName: "React",
-          cards: cards.map((c) => ({
-            id: c.id,
-            front: c.front,
-            back: c.back,
-            tags: c.tags ? c.tags.split(",").filter(Boolean) : [],
-            stability: c.stability,
-            difficulty: c.difficulty,
-            state: c.state,
-            reps: c.reps,
-            lapses: c.lapses,
-            due: c.due,
-            interval: c.interval,
-            reviews: [],
-          })),
-        },
-      ]);
+      await exportCardsToApkg(outPath);
+      await getDb().card.deleteMany();
 
-      // Import from the exported file
-      const imported = await importFromApkg(outPath);
+      const result = await importApkgFile(outPath);
 
-      expect(imported.decks.length).toBe(1);
-      expect(imported.decks[0].name).toBe("React");
-      expect(imported.decks[0].cards.length).toBe(2);
-
-      const fronts = imported.decks[0].cards.map((c) => c.front).sort();
-      expect(fronts).toEqual(["What is JSX?", "What is useState?"]);
-    });
-
-    it("preserves scheduling data through round-trip", async () => {
-      // Create and review a card to build scheduling state
-      await createCard({ deckId, front: "Scheduled Q", back: "Scheduled A" });
-      const session = await startSession();
-      const card = await getNextCard(session.id);
-      await submitReview(session.id, card!.id, Rating.Good, 1500);
-
-      const db = getDb();
-      const reviewedCard = await db.card.findUniqueOrThrow({
-        where: { id: card!.id },
-        include: { deck: true, reviews: true },
-      });
-
-      const outPath = join(tempDir, "scheduled.apkg");
-      await exportToApkg(outPath, [
-        {
-          deckName: "React",
-          cards: [
-            {
-              id: reviewedCard.id,
-              front: reviewedCard.front,
-              back: reviewedCard.back,
-              tags: [],
-              stability: reviewedCard.stability,
-              difficulty: reviewedCard.difficulty,
-              state: reviewedCard.state,
-              reps: reviewedCard.reps,
-              lapses: reviewedCard.lapses,
-              due: reviewedCard.due,
-              interval: reviewedCard.interval,
-              reviews: reviewedCard.reviews.map((r) => ({
-                rating: r.rating,
-                reviewedAt: r.reviewedAt,
-                responseMs: r.responseMs ?? 0,
-                stability: r.stability,
-                difficulty: r.difficulty,
-              })),
-            },
-          ],
-        },
-      ]);
-
-      const imported = await importFromApkg(outPath);
-      const importedCard = imported.decks[0].cards[0];
-
-      // Scheduling should be preserved
-      expect(importedCard.reps).toBe(reviewedCard.reps);
-      expect(importedCard.lapses).toBe(reviewedCard.lapses);
-      expect(importedCard.stability).toBeGreaterThan(0);
-    });
-
-    it("imports review history", async () => {
-      await createCard({ deckId, front: "Q", back: "A" });
-      const session = await startSession();
-      const card = await getNextCard(session.id);
-      await submitReview(session.id, card!.id, Rating.Good, 2000);
-
-      const db = getDb();
-      const reviewedCard = await db.card.findUniqueOrThrow({
-        where: { id: card!.id },
-        include: { deck: true, reviews: true },
-      });
-
-      const outPath = join(tempDir, "withreviews.apkg");
-      await exportToApkg(outPath, [
-        {
-          deckName: "React",
-          cards: [
-            {
-              id: reviewedCard.id,
-              front: reviewedCard.front,
-              back: reviewedCard.back,
-              tags: [],
-              stability: reviewedCard.stability,
-              difficulty: reviewedCard.difficulty,
-              state: reviewedCard.state,
-              reps: reviewedCard.reps,
-              lapses: reviewedCard.lapses,
-              due: reviewedCard.due,
-              interval: reviewedCard.interval,
-              reviews: reviewedCard.reviews.map((r) => ({
-                rating: r.rating,
-                reviewedAt: r.reviewedAt,
-                responseMs: r.responseMs ?? 0,
-                stability: r.stability,
-                difficulty: r.difficulty,
-              })),
-            },
-          ],
-        },
-      ]);
-
-      const imported = await importFromApkg(outPath);
-      expect(imported.decks[0].cards[0].reviews.length).toBe(1);
-      expect(imported.decks[0].cards[0].reviews[0].rating).toBe(Rating.Good);
+      expect(result).toEqual({ created: 2, updated: 0, duplicates: 0, invalid: 0 });
+      const after = await getDb().card.findMany({ orderBy: { front: "asc" }, include: { reviews: true } });
+      expect(after.map((c) => [c.front, c.back, c.tags, c.state, c.reps, c.lapses, c.suspended])).toEqual(
+        before.map((c) => [c.front, c.back, c.tags, c.state, c.reps, c.lapses, c.suspended])
+      );
+      const reviewed = after.find((c) => c.reviews.length > 0);
+      expect(reviewed?.reviews.map((r) => r.rating)).toEqual([Rating.Good]);
+      expect(reviewed?.stability).toBeGreaterThan(0);
     });
   });
 
-  describe("importApkgCards", () => {
+  describe("readApkg", () => {
+    const crt = Math.floor(new Date("2024-01-01T00:00:00Z").getTime() / 1000);
+
+    it("dates interday (re)learning cards from the collection's creation", () => {
+      const path = join(tempDir, "interday.apkg");
+      writeAnkiPackage(path, crt, [{ front: "Q", type: 3, queue: 3, due: 10, ivl: 1, factor: 2500, reps: 4, lapses: 1 }]);
+
+      const card = readApkg(path)[0].items[0];
+      expect(card.schedule.state).toBe(State.Relearning);
+      expect(card.schedule.due.toISOString()).toBe("2024-01-11T00:00:00.000Z");
+    });
+
+    it("reads intraday learning due dates as epoch seconds", () => {
+      const path = join(tempDir, "intraday.apkg");
+      const dueSeconds = Math.floor(new Date("2026-05-01T12:00:00Z").getTime() / 1000);
+      writeAnkiPackage(path, crt, [{ front: "Q", type: 1, queue: 1, due: dueSeconds, reps: 1 }]);
+
+      expect(readApkg(path)[0].items[0].schedule.due.toISOString()).toBe("2026-05-01T12:00:00.000Z");
+    });
+
+    it("carries suspension (queue -1)", () => {
+      const path = join(tempDir, "suspended.apkg");
+      writeAnkiPackage(path, crt, [
+        { front: "Suspended", type: 2, queue: -1, due: 30, ivl: 10, factor: 2500, reps: 3 },
+        { front: "Active", type: 2, queue: 2, due: 30, ivl: 10, factor: 2500, reps: 3 },
+      ]);
+
+      expect(readApkg(path)[0].items.map((c) => [c.front, c.schedule.suspended])).toEqual([
+        ["Suspended", true],
+        ["Active", false],
+      ]);
+    });
+
+    it("uses native FSRS memory state when the card has it", () => {
+      const path = join(tempDir, "fsrs.apkg");
+      writeAnkiPackage(path, crt, [
+        { front: "Q", type: 2, queue: 2, due: 30, ivl: 10, factor: 2500, reps: 3, data: '{"s":12.5,"d":3.25,"dr":0.9}' },
+      ]);
+
+      const { stability, difficulty } = readApkg(path)[0].items[0].schedule;
+      expect([stability, difficulty]).toEqual([12.5, 3.25]);
+    });
+
+    it("skips manual reschedules in the revlog and dates the last review", () => {
+      const path = join(tempDir, "revlog.apkg");
+      const first = Date.UTC(2026, 0, 1, 9);
+      writeAnkiPackage(path, crt, [{
+        front: "Q", type: 2, queue: 2, due: 30, ivl: 3, factor: 2500, reps: 2,
+        revlog: [[first, 3], [first + DAY_MS, 0], [first + 3 * DAY_MS, 4]],
+      }]);
+
+      const card = readApkg(path)[0].items[0];
+      expect(card.reviews.map((r) => r.rating)).toEqual([3, 4]);
+      expect(card.schedule.lastReview?.getTime()).toBe(first + 3 * DAY_MS);
+    });
+  });
+
+  describe("importApkgFile", () => {
     async function makeApkg(front: string, back: string): Promise<string> {
       const outPath = join(tempDir, `${front.slice(0, 8)}.apkg`);
       await exportToApkg(outPath, [{
         deckName: "React",
-        cards: [{ id: "test-id", front, back, tags: [], stability: 0, difficulty: 5, state: 0, reps: 0, lapses: 0, due: new Date(), interval: 0, reviews: [] }],
+        cards: [{
+          id: "test-id",
+          front,
+          back,
+          tags: [],
+          schedule: {
+            stability: 0, difficulty: 5, state: State.New, reps: 0, lapses: 0,
+            due: new Date(), interval: 0, lastReview: null, suspended: false,
+          },
+          reviews: [],
+        }],
       }]);
       return outPath;
     }
@@ -390,65 +307,70 @@ describe("anki-apkg", () => {
       const outPath = await makeApkg("What is JSX?", "Imported answer");
       const { card: local } = await createCard({ deckId, front: "What is JSX?", back: "Local answer" });
 
-      const imported = await importFromApkg(outPath);
-      const result = await importApkgCards(imported.decks[0].cards, deckId, {});
+      const result = await importApkgFile(outPath);
 
-      expect(result.created).toBe(0);
-      expect(result.updated).toBe(0);
-      expect(result.skipped).toBe(1);
+      expect(result).toEqual({ created: 0, updated: 0, duplicates: 1, invalid: 0 });
       const after = await getDb().card.findUniqueOrThrow({ where: { id: local.id } });
       expect(after.back).toBe("Local answer");
     });
 
-    it("skips duplicates with --ours (explicit keep-local)", async () => {
+    it("overwrites existing card with --theirs, clearing its leech flag", async () => {
       const outPath = await makeApkg("What is JSX?", "Imported answer");
       const { card: local } = await createCard({ deckId, front: "What is JSX?", back: "Local answer" });
+      await getDb().card.update({ where: { id: local.id }, data: { lapses: 6, leechFlaggedAt: new Date() } });
 
-      const imported = await importFromApkg(outPath);
-      const result = await importApkgCards(imported.decks[0].cards, deckId, { conflict: "ours" });
+      const result = await importApkgFile(outPath, { conflict: "theirs" });
 
-      expect(result.created).toBe(0);
-      expect(result.updated).toBe(0);
-      expect(result.skipped).toBe(1);
-      const after = await getDb().card.findUniqueOrThrow({ where: { id: local.id } });
-      expect(after.back).toBe("Local answer");
-    });
-
-    it("overwrites existing card with --theirs", async () => {
-      const outPath = await makeApkg("What is JSX?", "Imported answer");
-      const { card: local } = await createCard({ deckId, front: "What is JSX?", back: "Local answer" });
-
-      const imported = await importFromApkg(outPath);
-      const result = await importApkgCards(imported.decks[0].cards, deckId, { conflict: "theirs" });
-
-      expect(result.created).toBe(0);
-      expect(result.updated).toBe(1);
-      expect(result.skipped).toBe(0);
+      expect(result).toEqual({ created: 0, updated: 1, duplicates: 0, invalid: 0 });
       const after = await getDb().card.findUniqueOrThrow({ where: { id: local.id } });
       expect(after.back).toBe("Imported answer");
+      expect(after.leechFlaggedAt).toBeNull();
+      expect(after.lapses).toBe(0);
     });
 
     it("creates new cards regardless of conflict mode", async () => {
       const outPath = await makeApkg("Brand new card", "Some answer");
 
-      const imported = await importFromApkg(outPath);
-      const result = await importApkgCards(imported.decks[0].cards, deckId, { conflict: "theirs" });
+      const result = await importApkgFile(outPath, { conflict: "theirs" });
 
-      expect(result.created).toBe(1);
-      expect(result.updated).toBe(0);
-      expect(result.skipped).toBe(0);
+      expect(result).toEqual({ created: 1, updated: 0, duplicates: 0, invalid: 0 });
     });
 
     it("dry-run with --theirs reports counts but does not update", async () => {
       const outPath = await makeApkg("What is JSX?", "Imported answer");
       const { card: local } = await createCard({ deckId, front: "What is JSX?", back: "Local answer" });
 
-      const imported = await importFromApkg(outPath);
-      const result = await importApkgCards(imported.decks[0].cards, deckId, { conflict: "theirs", dryRun: true });
+      const result = await importApkgFile(outPath, { conflict: "theirs", dryRun: true });
 
       expect(result.updated).toBe(1);
       const after = await getDb().card.findUniqueOrThrow({ where: { id: local.id } });
       expect(after.back).toBe("Local answer");
+    });
+
+    it("writes history with the days between reviews, so it counts for calibration", async () => {
+      const path = join(tempDir, "history.apkg");
+      const first = Date.UTC(2026, 0, 1, 9);
+      writeAnkiPackage(path, 0, [{
+        front: "Q", type: 2, queue: 2, due: 30, ivl: 3, factor: 2500, reps: 2,
+        revlog: [[first, 3], [first + 3 * DAY_MS, 3]],
+      }]);
+
+      await importApkgFile(path);
+
+      const reviews = await getDb().review.findMany({ orderBy: { reviewedAt: "asc" } });
+      expect(reviews.map((r) => r.elapsedDays)).toEqual([0, 3]);
+    });
+
+    it("counts cards whose content breaks the card rules as invalid", async () => {
+      const path = join(tempDir, "invalid.apkg");
+      writeAnkiPackage(path, 0, [
+        { front: "Uses **markdown**", type: 0, queue: 0, due: 1 },
+        { front: "Fine", type: 0, queue: 0, due: 2 },
+      ]);
+
+      const result = await importApkgFile(path);
+
+      expect(result).toEqual({ created: 1, updated: 0, duplicates: 0, invalid: 1 });
     });
   });
 });

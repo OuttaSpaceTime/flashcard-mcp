@@ -2,18 +2,27 @@ import { getDb } from "../db/client.js";
 import { assertCardContent } from "./content-rules.js";
 import { assertCanCreateCard } from "./pressure.js";
 import { leechResolutionFor } from "./leeches.js";
-import { createNewFsrsCard } from "./scheduler.js";
+import { createNewFsrsCard, type SchedulableCard } from "./scheduler.js";
 import {
   checkDuplicate,
   findSimilarCards,
   getEmbedding,
   isEmbeddingsReady,
-  type CardForSimilarity,
+  COSINE_MATCH,
+  JACCARD_SIMILAR,
+  type DuplicateCheckResult,
   type SemanticOptions,
+  type SimilarCard,
 } from "./embeddings.js";
-import { parseTags, serializeTags } from "./types.js";
-import type { CardType, DuplicateCheckResult } from "./types.js";
-import type { Card as PrismaCard } from "@prisma/client";
+import { CARD_STATE_NAMES, parseTags, serializeTags, type CardStateName, type CardType } from "./types.js";
+import type { Card as PrismaCard, Prisma } from "@prisma/client";
+import type { State } from "ts-fsrs";
+
+/**
+ * A card's whole schedule brought in from elsewhere (an .apkg import): the
+ * FSRS block plus suspension, written as is.
+ */
+export type CarriedSchedule = SchedulableCard & { suspended: boolean };
 
 interface CreateCardInput {
   deckId: string;
@@ -22,7 +31,6 @@ interface CreateCardInput {
   tags?: string[];
   type?: CardType;
   category?: string | null;
-  source?: string;
   checkDuplicates?: boolean;
   /**
    * Card id to inherit the FSRS scheduling block from (due, stability,
@@ -31,10 +39,12 @@ interface CreateCardInput {
    * keeps the parent's learned schedule instead of resetting to a fresh New card.
    */
   inheritFrom?: string;
+  /** The schedule a card brings with it from an import; ignored with `inheritFrom`. */
+  schedule?: CarriedSchedule;
   /**
    * Skip the per-card SRS pressure gate. Only for batch writers that check
-   * pressure once up front for the whole batch (see importTxtNotes), so an
-   * import is refused atomically instead of aborting half-applied.
+   * pressure once up front for the whole batch (importCards in card-import.ts),
+   * so an import is refused atomically instead of aborting half-applied.
    */
   skipPressureGate?: boolean;
 }
@@ -44,24 +54,29 @@ interface CreateCardResult {
   duplicateWarning?: DuplicateCheckResult;
 }
 
+export type CardWithDeck = PrismaCard & { deck: { name: string } };
+
+const WITH_DECK_NAME = { deck: { select: { name: true } } } as const;
+
+/** Stored embeddings cover front and back, so every query embedding does too. */
 function cardEmbeddingText(front: string, back: string): string {
   return `${front} ${back}`;
 }
 
-function applyCategoryFilter(where: Record<string, unknown>, cat: string | undefined): void {
+function applyCategoryFilter(where: Prisma.CardWhereInput, cat: string | undefined): void {
   if (cat === "__uncategorized__") where.category = null;
   else if (cat === "__any__") where.category = { not: null };
   else if (cat != null && cat !== "") where.category = cat;
 }
 
-export const CARD_STATE_BY_NAME: Record<string, number> = {
-  new: 0,
-  learning: 1,
-  review: 2,
-  relearning: 3,
-};
+/** Card.state number for each state name (ts-fsrs `State`). */
+export const CARD_STATE_BY_NAME = Object.fromEntries(
+  CARD_STATE_NAMES.map((name, state) => [name, state as State])
+) as Record<CardStateName, State>;
 
-export type CardStateName = keyof typeof CARD_STATE_BY_NAME;
+function dueWhere(): Prisma.CardWhereInput {
+  return { due: { lte: new Date() }, suspended: false };
+}
 
 function scheduleEmbeddingUpdate(cardId: string, front: string, back: string): void {
   const db = getDb();
@@ -84,10 +99,11 @@ export async function createCard(input: CreateCardInput): Promise<CreateCardResu
     await assertCanCreateCard();
   }
 
-  // Scheduling block: fresh FSRS defaults, unless deriving from a parent card
-  // (split) — then inherit the parent's learned schedule so the new card keeps
-  // its place in the queue instead of resurfacing immediately.
-  let schedule = createNewFsrsCard();
+  // Scheduling block: fresh FSRS defaults or the one an import carries, unless
+  // deriving from a parent card (split) — then inherit the parent's learned
+  // schedule so the new card keeps its place in the queue instead of
+  // resurfacing immediately.
+  let schedule: SchedulableCard = input.schedule ?? createNewFsrsCard();
   if (input.inheritFrom != null) {
     const parent = await db.card.findUnique({ where: { id: input.inheritFrom } });
     if (parent == null) {
@@ -111,35 +127,20 @@ export async function createCard(input: CreateCardInput): Promise<CreateCardResu
 
   let duplicateWarning: DuplicateCheckResult | undefined;
 
-  if (input.checkDuplicates) {
+  if (input.checkDuplicates === true) {
     const existingCards = await db.card.findMany({
       where: { deckId: input.deckId },
       select: { id: true, front: true, embedding: true },
     });
 
-    const cardsSim: CardForSimilarity[] = existingCards.map((c) => ({
-      id: c.id,
-      front: c.front,
-      embedding: c.embedding,
-    }));
-
-    // Build semantic options if embeddings are loaded
     let semantic: SemanticOptions | undefined;
     if (isEmbeddingsReady()) {
       const queryEmb = await getEmbedding(cardEmbeddingText(input.front, input.back));
-      if (queryEmb) {
-        semantic = { queryEmbedding: queryEmb, cosineThreshold: 0.45 };
-      }
+      if (queryEmb) semantic = { queryEmbedding: queryEmb, cosineThreshold: COSINE_MATCH };
     }
 
-    const dupResult = checkDuplicate(input.front, cardsSim, 0.85, 0.65, semantic);
-    if (dupResult.isDuplicate || dupResult.similarCards.length > 0) {
-      duplicateWarning = {
-        isDuplicate: dupResult.isDuplicate,
-        reason: dupResult.reason,
-        similarCards: dupResult.similarCards,
-      };
-    }
+    const dupResult = checkDuplicate(input.front, existingCards, semantic);
+    if (dupResult.similarCards.length > 0) duplicateWarning = dupResult;
   }
 
   const card = await db.card.create({
@@ -150,7 +151,6 @@ export async function createCard(input: CreateCardInput): Promise<CreateCardResu
       tags: serializeTags(input.tags),
       type: input.type ?? "guided",
       category: input.category ?? null,
-      source: input.source ?? null,
       inheritedFrom: input.inheritFrom ?? null,
       due: schedule.due,
       stability: schedule.stability,
@@ -160,6 +160,7 @@ export async function createCard(input: CreateCardInput): Promise<CreateCardResu
       state: schedule.state,
       lastReview: schedule.lastReview,
       interval: schedule.interval,
+      suspended: input.inheritFrom == null && input.schedule?.suspended === true,
     },
   });
 
@@ -198,11 +199,39 @@ export async function backfillEmbeddings(
   return { processed, failed };
 }
 
+/** How many cards have an embedding, out of all of them. */
+export async function embeddingCoverage(): Promise<{ total: number; embedded: number }> {
+  const db = getDb();
+  const [total, embedded] = await Promise.all([
+    db.card.count(),
+    db.card.count({ where: { embedding: { not: null } } }),
+  ]);
+  return { total, embedded };
+}
+
+/** Every category in use (null: uncategorized) with its card count. */
+export async function listCategories(): Promise<Array<{ category: string | null; cards: number }>> {
+  const rows = await getDb().card.groupBy({ by: ["category"], _count: { _all: true } });
+  return rows.map((row) => ({ category: row.category, cards: row._count._all }));
+}
+
+/** Put every card of a deck in `category`; returns how many cards that was. */
+export async function setDeckCategory(deckId: string, category: string): Promise<number> {
+  const res = await getDb().card.updateMany({ where: { deckId }, data: { category } });
+  return res.count;
+}
+
 export async function getCard(id: string): Promise<PrismaCard | null> {
   const db = getDb();
   return db.card.findUnique({ where: { id } });
 }
 
+/**
+ * Edit a card. Content is checked, an answered leech flag is cleared, and the
+ * embedding follows a changed front or back. `schedule` replaces the whole
+ * schedule (an import's --theirs side); its lapse count wins over the flag
+ * clearing's reset, since it is the history the card now carries.
+ */
 export async function updateCard(
   id: string,
   updates: {
@@ -210,14 +239,15 @@ export async function updateCard(
     back?: string;
     tags?: string;
     category?: string | null;
-    source?: string;
+    schedule?: CarriedSchedule;
   }
 ): Promise<PrismaCard> {
   assertCardContent({ front: updates.front, back: updates.back });
   const db = getDb();
+  const { schedule, ...fields } = updates;
   const updated = await db.card.update({
     where: { id },
-    data: { ...updates, ...(await leechResolutionFor(id)) },
+    data: { ...fields, ...(await leechResolutionFor(id)), ...schedule },
   });
 
   if (updates.front !== undefined || updates.back !== undefined) {
@@ -237,13 +267,22 @@ export async function unsuspendCard(id: string): Promise<PrismaCard> {
   return db.card.update({ where: { id }, data: { suspended: false } });
 }
 
-// A tombstone is written with every delete. anki-sync needs it to tell a card
-// deleted here from one created on another machine and not yet synced down:
-// both look like "no row" otherwise, and guessing either way destroys cards.
+/**
+ * Records the deletion of these cards; every delete (card, cards, deck) writes
+ * one in the same transaction. anki-sync needs it to tell a card deleted here
+ * from one created on another machine and not yet synced down: both look like
+ * "no row" otherwise, and guessing either way destroys cards.
+ */
+export async function tombstone(tx: Prisma.TransactionClient, ids: string[]): Promise<void> {
+  for (const cardId of ids) {
+    await tx.deletedCard.upsert({ where: { cardId }, create: { cardId }, update: {} });
+  }
+}
+
 export async function deleteCard(id: string): Promise<void> {
   const db = getDb();
   await db.$transaction(async (tx) => {
-    await tx.deletedCard.upsert({ where: { cardId: id }, create: { cardId: id }, update: {} });
+    await tombstone(tx, [id]);
     await tx.card.delete({ where: { id } });
   });
 }
@@ -252,147 +291,151 @@ export async function deleteCards(ids: string[]): Promise<{ deleted: number }> {
   if (ids.length === 0) return { deleted: 0 };
   const db = getDb();
   return db.$transaction(async (tx) => {
-    const existing = await tx.card.findMany({ where: { id: { in: ids } }, select: { id: true } });
-    for (const { id } of existing) {
-      await tx.deletedCard.upsert({ where: { cardId: id }, create: { cardId: id }, update: {} });
-    }
-    const res = await tx.card.deleteMany({ where: { id: { in: existing.map((c) => c.id) } } });
+    const existing = (await tx.card.findMany({ where: { id: { in: ids } }, select: { id: true } })).map((c) => c.id);
+    await tombstone(tx, existing);
+    const res = await tx.card.deleteMany({ where: { id: { in: existing } } });
     return { deleted: res.count };
   });
 }
 
+/**
+ * Cards matching `where` whose tags include every one of `tags` exactly.
+ * SQL `contains` narrows the pool but false-positives ("foo" inside "foobar"),
+ * so the match is finished in JS over a bounded over-fetch.
+ */
+async function findCards(
+  where: Prisma.CardWhereInput,
+  tags: string[],
+  orderBy: Prisma.CardOrderByWithRelationInput,
+  offset: number,
+  limit: number
+): Promise<CardWithDeck[]> {
+  const db = getDb();
+  if (tags.length === 0) {
+    return db.card.findMany({ where, include: WITH_DECK_NAME, orderBy, skip: offset, take: limit });
+  }
+  const candidates = await db.card.findMany({
+    where: { ...where, AND: tags.map((tag) => ({ tags: { contains: tag } })) },
+    include: WITH_DECK_NAME,
+    orderBy,
+    take: (offset + limit) * 4,
+  });
+  return candidates
+    .filter((c) => {
+      const cardTags = parseTags(c.tags);
+      return tags.every((tag) => cardTags.includes(tag));
+    })
+    .slice(offset, offset + limit);
+}
+
 export async function listCards(filters: {
   deckId?: string;
-  tagFilter?: "empty" | "has_any" | string;
+  /** "empty" (no tags), "has_any", or one tag the card must carry exactly. */
+  tagFilter?: string;
   category?: string;
-  state?: CardStateName | string;
+  state?: string;
+  /** Only cards due now (unsuspended, due ≤ now). */
+  due?: boolean;
+  /** "created": newest first (default); "due": soonest due first. */
+  orderBy?: "created" | "due";
   limit?: number;
   offset?: number;
-}): Promise<PrismaCard[]> {
-  const db = getDb();
+}): Promise<CardWithDeck[]> {
   const limit = Math.max(1, Math.min(filters.limit ?? 50, 200));
   const offset = Math.max(0, filters.offset ?? 0);
 
-  const where: Record<string, unknown> = {};
+  const where: Prisma.CardWhereInput = filters.due === true ? dueWhere() : {};
   if (filters.deckId != null && filters.deckId !== "") {
     where.deckId = filters.deckId;
   }
 
   if (filters.state != null && filters.state !== "") {
-    if (!Object.prototype.hasOwnProperty.call(CARD_STATE_BY_NAME, filters.state)) {
-      throw new Error(
-        `Invalid state "${filters.state}". Expected one of: ${Object.keys(CARD_STATE_BY_NAME).join(", ")}`
-      );
+    const state = CARD_STATE_NAMES.indexOf(filters.state as CardStateName);
+    if (state < 0) {
+      throw new Error(`Invalid state "${filters.state}". Expected one of: ${CARD_STATE_NAMES.join(", ")}`);
     }
-    where.state = CARD_STATE_BY_NAME[filters.state];
+    where.state = state;
   }
 
   applyCategoryFilter(where, filters.category);
 
   const tf = filters.tagFilter;
-  const isExactTag = tf != null && tf !== "" && tf !== "empty" && tf !== "has_any";
-
   if (tf === "empty") where.tags = "";
   else if (tf === "has_any") where.tags = { not: "" };
-  else if (isExactTag) where.tags = { contains: tf };
+  const exactTags = tf != null && tf !== "" && tf !== "empty" && tf !== "has_any" ? [tf] : [];
 
-  if (isExactTag) {
-    // `contains` can false-positive ("foo" inside "foobar"), so post-filter in JS.
-    // Over-fetch a bounded pool rather than loading every substring match.
-    const candidates = await db.card.findMany({
-      where,
-      orderBy: { createdAt: "desc" },
-      take: (offset + limit) * 4,
-    });
-    const matched = candidates.filter((c) => parseTags(c.tags).includes(tf));
-    return matched.slice(offset, offset + limit);
-  }
-
-  return db.card.findMany({
-    where,
-    orderBy: { createdAt: "desc" },
-    skip: offset,
-    take: limit,
-  });
+  const orderBy: Prisma.CardOrderByWithRelationInput =
+    filters.orderBy === "due" ? { due: "asc" } : { createdAt: "desc" };
+  return findCards(where, exactTags, orderBy, offset, limit);
 }
 
+/** Cards whose front or back contains `query`, newest first; each tag must match exactly. */
 export async function searchCards(
   query: string,
-  filters?: {
+  filters: {
     deckId?: string;
     tags?: string[];
     category?: string;
-    state?: number;
-  }
-): Promise<PrismaCard[]> {
-  const db = getDb();
-
-  const where: Record<string, unknown> = {};
+    limit?: number;
+  } = {}
+): Promise<CardWithDeck[]> {
+  const where: Prisma.CardWhereInput = {};
 
   if (query !== "") {
-    where.OR = [
-      { front: { contains: query } },
-      { back: { contains: query } },
-    ];
+    where.OR = [{ front: { contains: query } }, { back: { contains: query } }];
   }
 
-  if (filters?.deckId) {
+  if (filters.deckId != null && filters.deckId !== "") {
     where.deckId = filters.deckId;
   }
 
-  if (filters?.tags && filters.tags.length > 0) {
-    where.AND = filters.tags.map((tag) => ({
-      tags: { contains: tag },
-    }));
-  }
+  applyCategoryFilter(where, filters.category);
 
-  if (filters?.state !== undefined) {
-    where.state = filters.state;
-  }
-
-  applyCategoryFilter(where, filters?.category);
-
-  return db.card.findMany({ where, orderBy: { createdAt: "desc" }, take: 100 });
+  return findCards(where, filters.tags ?? [], { createdAt: "desc" }, 0, filters.limit ?? 100);
 }
 
-export async function getDueCards(limit: number = 30) {
+/** Unsuspended cards due now, soonest first. Counts New cards too: not the review backlog. */
+export async function getDueCards(limit: number = 30): Promise<CardWithDeck[]> {
   const db = getDb();
   return db.card.findMany({
-    where: { due: { lte: new Date() }, suspended: false },
-    include: { deck: { select: { name: true } } },
+    where: dueWhere(),
+    include: WITH_DECK_NAME,
     take: limit,
     orderBy: { due: "asc" },
   });
 }
 
+/** How many cards getDueCards would return without a limit. */
+export async function countDueCards(): Promise<number> {
+  return getDb().card.count({ where: dueWhere() });
+}
+
+/** Every card with its deck name, newest first. */
+export async function allCards(): Promise<CardWithDeck[]> {
+  return getDb().card.findMany({ include: WITH_DECK_NAME, orderBy: { createdAt: "desc" } });
+}
+
+/**
+ * Cards similar to `text`: Jaccard word overlap against each card's front,
+ * then (once embeddings are loaded) cosine similarity against each card's
+ * front+back embedding. Pass a card's front and back joined by a space for
+ * the semantic stage to compare like with like, as createCard does.
+ */
 export async function findSimilar(
   text: string,
-  opts?: { deckId?: string; jaccardThreshold?: number; cosineThreshold?: number }
-) {
+  opts: { deckId?: string; jaccardThreshold?: number; cosineThreshold?: number } = {}
+): Promise<SimilarCard[]> {
   const db = getDb();
-  const where: Record<string, unknown> = {};
-  if (opts?.deckId) where.deckId = opts.deckId;
-
   const existingCards = await db.card.findMany({
-    where,
+    where: opts.deckId != null && opts.deckId !== "" ? { deckId: opts.deckId } : {},
     select: { id: true, front: true, embedding: true },
   });
 
   let semantic: SemanticOptions | undefined;
   if (isEmbeddingsReady()) {
     const emb = await getEmbedding(text);
-    if (emb) {
-      semantic = {
-        queryEmbedding: emb,
-        cosineThreshold: opts?.cosineThreshold ?? 0.45,
-      };
-    }
+    if (emb) semantic = { queryEmbedding: emb, cosineThreshold: opts.cosineThreshold ?? COSINE_MATCH };
   }
 
-  return findSimilarCards(
-    text,
-    existingCards,
-    opts?.jaccardThreshold ?? 0.50,
-    semantic
-  );
+  return findSimilarCards(text, existingCards, opts.jaccardThreshold ?? JACCARD_SIMILAR, semantic);
 }

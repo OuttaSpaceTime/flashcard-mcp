@@ -1,9 +1,9 @@
 import { execFileSync } from "child_process";
 import { createHash } from "crypto";
 import { copyFileSync, existsSync, readFileSync, statSync } from "fs";
-import { join, resolve } from "path";
-import { fileURLToPath } from "url";
+import { join } from "path";
 import type { PrismaClient } from "@prisma/client";
+import { clientUrl, ROOT } from "./client.js";
 
 /**
  * Keeps a database's tables in step with prisma/schema.prisma, on every start
@@ -27,8 +27,6 @@ import type { PrismaClient } from "@prisma/client";
  * baselined on each machine's existing deck first.
  */
 
-const ROOT = fileURLToPath(new URL("../../", import.meta.url));
-
 /** The fingerprint of a schema: 31 bits of its SHA-256, never 0 (0 is "never synced"). */
 export function schemaVersion(schema: string): number {
   const v = createHash("sha256").update(schema).digest().readUInt32BE(0) & 0x7fffffff;
@@ -37,7 +35,7 @@ export function schemaVersion(schema: string): number {
 
 export interface SyncOptions {
   schemaPath?: string;
-  /** The database's `file:` URL; DATABASE_URL, else the default master.db. */
+  /** The database's `file:` URL; defaults to the one `db` was created with. */
   dbUrl?: string;
   /** Runs `prisma db push` against the URL (injected by the tests). */
   push?: (dbUrl: string) => void;
@@ -49,8 +47,7 @@ export async function syncSchema(db: PrismaClient, opts: SyncOptions = {}): Prom
   const rows = await db.$queryRawUnsafe<{ user_version: number | bigint }[]>("PRAGMA user_version");
   if (Number(rows[0]?.user_version ?? 0) === want) return false;
 
-  const url = opts.dbUrl ?? process.env["DATABASE_URL"] ?? "file:./prisma/master.db";
-  const file = resolve(url.replace(/^file:/, ""));
+  const file = (opts.dbUrl ?? clientUrl(db)).replace(/^file:/, "");
   if (existsSync(file) && statSync(file).size > 0) {
     copyFileSync(file, `${file}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}-schema`);
   }

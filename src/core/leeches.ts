@@ -78,11 +78,12 @@ export async function findUnresolvedLeeches(): Promise<PrismaCard[]> {
   return flagged.filter(isUnresolvedLeech);
 }
 
-/** Throws while any card carries a flag the developer has not answered. */
-export async function assertNoUnresolvedLeech(): Promise<void> {
-  const unresolved = await findUnresolvedLeeches();
-  if (unresolved.length === 0) return;
-
+/**
+ * The block raised while `unresolved` (findUnresolvedLeeches) is not empty:
+ * one entry per card, each with the four ways out. For Claude the message is
+ * the instruction, so it names the tool calls.
+ */
+export function leechBlockError(unresolved: PrismaCard[]): Error {
   const blocks = unresolved.map(
     (card) =>
       `Card ${card.id} has lapsed ${card.lapses} times (leech at ${LEECH_LAPSES}). Pick one:
@@ -92,20 +93,22 @@ export async function assertNoUnresolvedLeech(): Promise<void> {
 - resolve_leech(cardId: "${card.id}", action: "defer") — keep it as it is; it flags again on the next lapse`
   );
 
-  throw new Error(`Study blocked: a card keeps failing and needs a decision.\n${blocks.join("\n\n")}`);
+  return new Error(`Study blocked: a card keeps failing and needs a decision.\n${blocks.join("\n\n")}`);
 }
 
 /**
  * Keep a flagged card as it is. The lapse count it was flagged at is recorded,
  * so the same card stops blocking now and flags again the next time it fails.
  */
-export async function deferLeech(cardId: string): Promise<PrismaCard> {
+export async function deferLeech(cardId: string): Promise<{ cardId: string; deferredAtLapses: number | null }> {
   const db = getDb();
-  const card = await db.card.findUnique({ where: { id: cardId } });
+  const card = await db.card.findUnique({ where: { id: cardId }, select: { lapses: true } });
   if (card == null) throw new Error(`Card not found: ${cardId}`);
 
-  return db.card.update({
+  const updated = await db.card.update({
     where: { id: cardId },
     data: { leechDeferredLapses: card.lapses },
+    select: { id: true, leechDeferredLapses: true },
   });
+  return { cardId: updated.id, deferredAtLapses: updated.leechDeferredLapses };
 }

@@ -5,48 +5,50 @@ A spaced-repetition flashcard system with an MCP server and CLI, built on TypeSc
 ## Features
 
 - **FSRS scheduling** — state-of-the-art spaced repetition via `ts-fsrs`
-- **MCP server** — 25 tools for sessions, cards, decks, stats, pressure, calibration, leech enforcement, and duplicate detection over stdio
-- **CLI** — `init`, `decks`, `cards`, `categories`, `study`, `stats`, `calibration`, `topics`, `import`, `export`, `embeddings`, `db:dump`, `db:restore`
+- **MCP server** — 27 tools for sessions, cards, decks, stats, pressure, calibration, leech enforcement, card notes, and duplicate detection over stdio
+- **CLI** — `init`, `decks`, `cards`, `categories`, `study`, `stats`, `calibration`, `overview`, `maturity`, `import`, `export`, `embeddings`, `db:dump`, `db:restore`, `db:sync`
 - **Semantic duplicate detection** — two-stage Jaccard + cosine similarity on 384-dim embeddings
 - **Anki interop** — import/export `.apkg` (including zstd-compressed `collection.anki21b`) with full scheduling, plus plain-text `.txt`
 - **Categories** — tag cards with a free-form category and filter sessions/lists accordingly
-- **Anti-overload** — caps new cards at 5 and reviews at 15 per session; card creation requires explicit approval
+- **Anti-overload** — caps new cards at 5 and reviews at 15 per session (the `Config` row's defaults); card creation requires explicit approval
 
 ## Setup
 
 ```bash
-npm install
+npm install             # the SQLite database itself is created/updated by every start
 npx prisma generate     # generate Prisma client
-npm run dev:cli -- init # create the SQLite database and default decks
+npm run dev:cli -- init # create the default decks
 ```
 
 ## CLI
 
 ```bash
-npm run dev:cli -- init                       # create default decks + config
+npm run dev:cli -- init                       # create the default decks
 npm run dev:cli -- decks                      # list decks with stats
 npm run dev:cli -- cards add <deck> -f ... -b ...   # add a card
-npm run dev:cli -- cards list [--deck X] [--category <name>] [--uncategorized] [--due]
+npm run dev:cli -- cards list [--deck X] [--category <name>] [--uncategorized] [--due] [--state <name>] [--limit N]
 npm run dev:cli -- cards search <query>
 npm run dev:cli -- categories list            # categories in use, with counts
 npm run dev:cli -- categories add <name> --deck X | --card <id>
 npm run dev:cli -- study [--deck X] [--category <name>] [--limit N]
 npm run dev:cli -- stats                      # streak, retention, maturity, lapses
 npm run dev:cli -- calibration                # true retention + difficulty verdict, as JSON
-npm run dev:cli -- topics                     # maturity report per deck
-npm run dev:cli -- import <file> [--deck X] [--ours|--theirs] [--dry-run]
+npm run dev:cli -- overview                   # pending cards + progress picture, as JSON
+npm run dev:cli -- maturity                   # maturity report per deck
+npm run dev:cli -- import <file> [--deck X] [--ours|--theirs] [--dry-run]   # .apkg/.colpkg or .txt
 npm run dev:cli -- export <file> [--deck X]
 npm run dev:cli -- embeddings status
 npm run dev:cli -- embeddings backfill
 npm run dev:cli -- db:dump <file>             # portable SQL dump
 npm run dev:cli -- db:restore <file> [--force]
+npm run dev:cli -- db:sync                    # push prisma/schema.prisma now (every start does it anyway)
 ```
 
 After `npm run build`, the CLI is available as the `master` binary.
 
 ## App server (Omvida)
 
-`npm run dev:app` (`src/app/server.ts`) is what the [Omvida](../omvida) desktop app talks to: JSON lines over stdio, one long-lived process per app. It exposes the study loop (`startSession`, `nextCard`, `grade`, `review`, `skip`, `endSession`, `resolveLeech`), the deck for browsing (`cards`, `cardsByIds`, `searchCards`, `recentlyStudied`), card notes (`notes`, `setNote`), recent sessions with the cards each lapsed and noted (`sessions`), `overview`, and `stamp`, a token in three parts that move whenever any process edits a card, reviews one, or writes a note, which the app polls to notice a card fixed in Claude Code. A review keeps the card's `updatedAt`, so the cards part means content edits only. `grade` asks `claude -p` for a suggested rating with a one-sentence reason (`src/core/grading.ts`); the developer accepts or overrides it before anything is written. `master overview` prints the same overview as JSON for the Omvida bar widget.
+`npm run dev:app` (`src/app/server.ts`) is what the [Omvida](../omvida) desktop app talks to: JSON lines over stdio, one long-lived process per app. It exposes the study loop (`startSession`, `nextCard`, `grade`, `review`, `skip`, `endSession`, `resolveLeech`), the deck for browsing and editing (`cards`, `searchCards`, `recentlyStudied`, `deleteCard`), card notes (`notes`, `setNote`), recent sessions with the cards each lapsed and noted (`sessions`), `overview`, and `stamp`, a token in three parts that move whenever any process edits a card, reviews one, or writes a note, which the app polls to notice a card fixed in Claude Code. A review keeps the card's `updatedAt`, so the cards part means content edits only. `grade` asks `claude -p` for a suggested rating with a one-sentence reason (`src/core/grading.ts`); the developer accepts or overrides it before anything is written. `master overview` prints the same overview as JSON for the Omvida bar widget.
 
 ## MCP server
 
@@ -74,7 +76,7 @@ Cards: `create_card`, `get_card`, `update_card`, `delete_card`, `delete_cards`, 
 Card notes: `list_card_notes`, `resolve_card_note`
 Decks & stats: `list_decks`, `get_deck_stats`, `delete_deck`, `get_stats`, `check_pressure`, `check_calibration`, `get_session_history`
 
-`check_pressure` is the single source of truth for due counts and the SRS pressure verdict (`ok`/`warn`/`pause`) across two axes: review backlog (due cards excluding state New) and cards added today. `create_card` is blocked while it reads pause; `inheritFrom` splits and `update_card` are always allowed, and splits are excluded from the intake axis via the `Card.inheritedFrom` column. The reported `clearance` covers the flashcards axis only, since reviewing cannot lower intake — only the start of the next day resets it. `.txt` import checks pressure once up front, so it is either refused whole or runs to completion.
+`check_pressure` is the single source of truth for due counts and the SRS pressure verdict (`ok`/`warn`/`pause`) across two axes: review backlog (due cards excluding state New) and cards added today. `create_card` is blocked while it reads pause; `inheritFrom` splits and `update_card` are always allowed, and splits are excluded from the intake axis via the `Card.inheritedFrom` column. The reported `clearance` covers the flashcards axis only, since reviewing cannot lower intake — only the start of the next day resets it. `newAvailable` is the whole unsuspended New-card pool a session draws from. Imports (`.apkg` and `.txt`) check pressure once up front, and only when they would create new cards, so an import is either refused whole or runs to completion.
 
 `check_calibration` answers whether the questions are at the right difficulty: true retention over the last 30 days (Anki's convention — reviews with `elapsedDays >= 1`, first review per card per **local** calendar day, rated 3 or better) against an 80-90% band, plus a `low-signal` verdict when there are fewer than 50 eligible reviews or more than 80% of ratings are Good. The same report is printed as JSON by `npm run dev:cli -- calibration`, which is what the study repo's `/study` skill reads.
 
@@ -109,7 +111,8 @@ The most recent variant found takes precedence. Deck names and hierarchy come fr
 
 - Cards exported from Anki with its native FSRS scheduler store parameters in `card.data` JSON (`{"s": stability, "d": difficulty}`). Used directly.
 - Classic SM-2 cards are converted: interval → FSRS stability, ease factor → FSRS difficulty (1–10 scale).
-- Review history (ratings, timestamps, response times) is imported for all cards.
+- Review history (ratings, timestamps, response times) is imported for all cards; Anki's manual-reschedule rows (ease 0) are skipped, and `elapsedDays` comes from the gap between reviews so imported history counts toward calibration.
+- Suspended cards (queue -1) stay suspended.
 
 **Conflict resolution on re-import** — when a card with the same front exists in the deck:
 
@@ -119,7 +122,7 @@ npm run dev:cli -- import file.apkg --theirs             # overwrite local with 
 npm run dev:cli -- import file.apkg --theirs --dry-run   # preview changes
 ```
 
-`--theirs` overwrites `back`, `tags`, and all scheduling fields. New cards are always created regardless of conflict mode. `--ours` and `--theirs` are mutually exclusive.
+`--theirs` overwrites `back`, `tags`, and all scheduling fields (and clears a leech flag, as any rewrite does). New cards are always created regardless of conflict mode. `--ours` and `--theirs` are mutually exclusive. Every card passes the same content rules as `create_card`; cards that fail are counted as `invalid` and skipped, and the summary reads `created, updated, duplicates, invalid`.
 
 ### `.apkg` export
 
@@ -128,17 +131,17 @@ npm run dev:cli -- export output.apkg           # all decks
 npm run dev:cli -- export output.apkg -d react  # single deck
 ```
 
-Exports a standard `collection.anki21` database (uncompressed SQLite) inside a ZIP. FSRS parameters are converted back to SM-2 so the file opens in Anki's default scheduler. Review history included.
+Exports a standard `collection.anki21` database (uncompressed SQLite) inside a ZIP. FSRS parameters are converted back to SM-2 so the file opens in Anki's default scheduler. Review history included. Export writes `.apkg` only; a `.colpkg` name is refused, since Anki treats that as a whole collection.
 
 ### Plain-text `.txt` import/export
 
 ```bash
-npm run dev:cli -- import cards.txt -d MyDeck           # Anki "Notes in Plain Text"
+npm run dev:cli -- import cards.txt -d MyDeck           # Anki "Notes in Plain Text"; without -d, the deck the file names
 npm run dev:cli -- import cards.txt -d MyDeck --theirs  # overwrite duplicates
 npm run dev:cli -- export cards.txt                     # export all cards
 ```
 
-Tab-separated format with `#separator`, `#html`, and `#tags` header directives. No scheduling data — cards are imported as new. The same `--ours`/`--theirs` conflict flags apply.
+Tab-separated format with `#separator`, `#html`, `#tags` and column header directives (`#html` is written on export, not read on import). No scheduling data — cards are imported as new. The same `--ours`/`--theirs` conflict flags apply.
 
 ### AnkiWeb sync (external)
 
@@ -148,14 +151,14 @@ Live sync to AnkiWeb (for reviewing on the phone) is handled by [`scripts/anki-s
 - **Bidirectional scheduling** — the side with the newer last review wins its whole FSRS block; `stability`/`difficulty` map natively to Anki's `memory_state`, no SM-2 conversion.
 - **Append-only review history** — revlog and the `Review` table are unioned by (card, timestamp).
 
-Implications for this codebase: keep card CUIDs stable, and treat `Card` scheduling fields and `Review` rows as writable by the external sync (short transactions, ISO-8601 or legacy epoch-ms datetimes both occur in existing data).
+Implications for this codebase: keep card CUIDs stable, and treat `Card` scheduling fields and `Review` rows as writable by the external sync (short transactions). Every delete writes a `DeletedCard` tombstone the sync reads. Datetimes the sync writes as epoch-ms are normalized to ISO text on every start.
 
 ## Development
 
 ```bash
 npm test              # vitest
-npm run typecheck     # TypeScript strict mode
-npm run lint          # ESLint
+npm run typecheck     # TypeScript strict mode, src/ and __tests__/
+npm run lint          # ESLint, src/ and __tests__/
 npm run build         # compile to build/
 ```
 
@@ -163,4 +166,4 @@ Tests use isolated temp SQLite databases per suite (see `__tests__/setup.ts`) an
 
 ## License
 
-MIT
+MIT, see [LICENSE](LICENSE).

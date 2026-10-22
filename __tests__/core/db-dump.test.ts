@@ -103,6 +103,19 @@ describe("restoreDatabase", () => {
     expect(card.stability).toBe(1.5);
   });
 
+  it("carries the schema fingerprint, so a restore does not trigger a schema push", () => {
+    const src = new Database(srcDb);
+    src.pragma("user_version = 12345");
+    src.close();
+
+    dumpDatabase(srcDb, dumpFile);
+    restoreDatabase(restoreDb, dumpFile);
+
+    const db = new Database(restoreDb, { readonly: true });
+    expect(db.pragma("user_version", { simple: true })).toBe(12345);
+    db.close();
+  });
+
   it("refuses to overwrite an existing file without force", () => {
     dumpDatabase(srcDb, dumpFile);
     restoreDatabase(restoreDb, dumpFile, {});

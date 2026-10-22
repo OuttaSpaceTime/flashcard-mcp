@@ -2,81 +2,69 @@ import { describe, it, expect } from "vitest";
 import {
   getStudyStreak,
   getRetentionByDeck,
-  getWeeklyStats,
   getMaturityReport,
   getLapsePatterns,
   getSessionHistory,
 } from "../../src/core/analytics-service.js";
 import { getDb } from "../../src/db/client.js";
-import { State, Rating } from "ts-fsrs";
+import { State } from "ts-fsrs";
+
+/** A review at each of `dates`, on one card. */
+async function reviewsAt(...dates: Date[]): Promise<void> {
+  const db = getDb();
+  const deck = await db.deck.create({ data: { name: `Streak ${Math.random()}` } });
+  const card = await db.card.create({ data: { deckId: deck.id, front: "Q", back: "A" } });
+  for (const reviewedAt of dates) {
+    await db.review.create({
+      data: { cardId: card.id, rating: 3, stability: 1, difficulty: 5, elapsedDays: 0, reviewedAt },
+    });
+  }
+}
 
 describe("analytics-service", () => {
   describe("getStudyStreak", () => {
-    it("returns 0 when no sessions exist", async () => {
-      const streak = await getStudyStreak();
-      expect(streak).toBe(0);
-    });
-
-    // A study day is a local calendar day: a session just after local
-    // midnight belongs to today even where that instant is yesterday in UTC.
-    it("counts a session just after local midnight as today", async () => {
+    // Local noon, `daysBack` local days before today.
+    function daysAgo(daysBack: number): Date {
       const now = new Date();
-      const justAfterMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 30);
-      if (justAfterMidnight > now) return; // the first half hour of a day: nothing to test yet
-      await getDb().studySession.create({
-        data: { cardsReviewed: 3, startTime: justAfterMidnight, endTime: justAfterMidnight },
-      });
-      expect(await getStudyStreak()).toBe(1);
+      return new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysBack, 12);
+    }
+    const NOW = daysAgo(0);
+
+    it("returns 0 when nothing was reviewed", async () => {
+      expect(await getStudyStreak(NOW)).toBe(0);
     });
 
-    it("returns 1 for a session today", async () => {
-      const db = getDb();
-      await db.studySession.create({
-        data: { cardsReviewed: 5, endTime: new Date() },
-      });
-
-      const streak = await getStudyStreak();
-      expect(streak).toBe(1);
+    // A study day is a local calendar day: a review just after local
+    // midnight belongs to today even where that instant is yesterday in UTC.
+    it("counts a review just after local midnight as today", async () => {
+      const justAfterMidnight = new Date(NOW.getFullYear(), NOW.getMonth(), NOW.getDate(), 0, 30);
+      await reviewsAt(justAfterMidnight);
+      expect(await getStudyStreak(NOW)).toBe(1);
     });
 
     it("counts consecutive days", async () => {
-      const db = getDb();
-      const today = new Date();
-      const yesterday = new Date(today.getTime() - 24 * 60 * 60 * 1000);
-      const twoDaysAgo = new Date(today.getTime() - 2 * 24 * 60 * 60 * 1000);
-
-      for (const date of [today, yesterday, twoDaysAgo]) {
-        await db.studySession.create({
-          data: {
-            startTime: date,
-            endTime: date,
-            cardsReviewed: 5,
-          },
-        });
-      }
-
-      const streak = await getStudyStreak();
-      expect(streak).toBe(3);
+      await reviewsAt(daysAgo(0), daysAgo(1), daysAgo(2));
+      expect(await getStudyStreak(NOW)).toBe(3);
     });
 
     it("breaks streak on gap day", async () => {
-      const db = getDb();
-      const today = new Date();
-      const twoDaysAgo = new Date(today.getTime() - 2 * 24 * 60 * 60 * 1000);
+      await reviewsAt(daysAgo(0), daysAgo(2));
+      expect(await getStudyStreak(NOW)).toBe(1);
+    });
 
-      await db.studySession.create({
-        data: { startTime: today, endTime: today, cardsReviewed: 5 },
-      });
-      await db.studySession.create({
-        data: {
-          startTime: twoDaysAgo,
-          endTime: twoDaysAgo,
-          cardsReviewed: 5,
-        },
-      });
+    // A session started before midnight whose reviews run past it studied on
+    // both days; counting by session start credited only the first.
+    it("credits each day a session's reviews fall on", async () => {
+      const yesterdayLate = new Date(NOW.getFullYear(), NOW.getMonth(), NOW.getDate() - 1, 23, 50);
+      const todayEarly = new Date(NOW.getFullYear(), NOW.getMonth(), NOW.getDate(), 0, 10);
+      await getDb().studySession.create({ data: { startTime: yesterdayLate, cardsReviewed: 2 } });
+      await reviewsAt(yesterdayLate, todayEarly);
+      expect(await getStudyStreak(NOW)).toBe(2);
+    });
 
-      const streak = await getStudyStreak();
-      expect(streak).toBe(1);
+    it("follows a streak longer than the first window it reads", async () => {
+      await reviewsAt(...Array.from({ length: 40 }, (_, i) => daysAgo(i)));
+      expect(await getStudyStreak(NOW)).toBe(40);
     });
   });
 

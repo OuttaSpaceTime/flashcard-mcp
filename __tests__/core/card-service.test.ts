@@ -9,6 +9,7 @@ import {
   unsuspendCard,
   searchCards,
   listCards,
+  countDueCards,
 } from "../../src/core/card-service.js";
 import { PAUSE_FLASHCARDS } from "../../src/core/pressure.js";
 import { createDeck } from "../../src/core/deck-service.js";
@@ -275,20 +276,6 @@ describe("card-service", () => {
       const found = await getCard(card.id);
       expect(found).toBeNull();
     });
-
-    it("leaves a tombstone so the Anki sync does not re-import the card", async () => {
-      const { card } = await createCard({ deckId: testDeckId, front: "Q", back: "A" });
-
-      await deleteCard(card.id);
-
-      const tomb = await getDb().deletedCard.findUnique({ where: { cardId: card.id } });
-      expect(tomb).not.toBeNull();
-    });
-
-    it("writes no tombstone when the card does not exist", async () => {
-      await expect(deleteCard("nonexistent-id")).rejects.toThrow();
-      expect(await getDb().deletedCard.count()).toBe(0);
-    });
   });
 
   describe("suspendCard / unsuspendCard", () => {
@@ -375,6 +362,20 @@ describe("card-service", () => {
       const results = await searchCards("", { tags: ["hooks"] });
       expect(results.length).toBe(1);
       expect(results[0].front).toBe("Q1");
+    });
+
+    it("matches tags exactly, not as substrings", async () => {
+      await createCard({ deckId: testDeckId, front: "Q1", back: "A1", tags: ["foo"] });
+      await createCard({ deckId: testDeckId, front: "Q2", back: "A2", tags: ["foobar"] });
+
+      const results = await searchCards("", { tags: ["foo"] });
+      expect(results.map((c) => c.front)).toEqual(["Q1"]);
+    });
+
+    it("returns at most `limit` cards", async () => {
+      for (const q of ["Q1", "Q2", "Q3"]) await createCard({ deckId: testDeckId, front: q, back: "A" });
+
+      expect(await searchCards("Q", { limit: 2 })).toHaveLength(2);
     });
   });
 
@@ -498,6 +499,21 @@ describe("card-service", () => {
 
     it("throws on invalid state name", async () => {
       await expect(listCards({ state: "bogus" })).rejects.toThrow(/Invalid state/);
+    });
+
+    it("filters due cards, orders by due and names the deck", async () => {
+      const db = getDb();
+      const { card: later } = await createCard({ deckId: testDeckId, front: "Later", back: "A" });
+      const { card: sooner } = await createCard({ deckId: testDeckId, front: "Sooner", back: "A" });
+      const { card: future } = await createCard({ deckId: testDeckId, front: "Future", back: "A" });
+      await db.card.update({ where: { id: later.id }, data: { due: new Date(Date.now() - 1000) } });
+      await db.card.update({ where: { id: sooner.id }, data: { due: new Date(Date.now() - 60_000) } });
+      await db.card.update({ where: { id: future.id }, data: { due: new Date(Date.now() + 86_400_000) } });
+
+      const due = await listCards({ due: true, orderBy: "due" });
+      expect(due.map((c) => c.front)).toEqual(["Sooner", "Later"]);
+      expect(due[0].deck.name).toBe("TestDeck");
+      expect(await countDueCards()).toBe(2);
     });
   });
 

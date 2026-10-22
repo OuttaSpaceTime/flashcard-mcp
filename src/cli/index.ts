@@ -1,37 +1,43 @@
 #!/usr/bin/env node
 
-import { Command } from "commander";
-import { createClient, setDb } from "../db/client.js";
-import { prepareDatabase } from "../db/prepare.js";
-import { createDeck, listDecks, getDeckStats, getDeckByName, getOrCreateDeck } from "../core/deck-service.js";
-import { parseTags } from "../core/types.js";
-import { createCard, searchCards, backfillEmbeddings, updateCard, CARD_STATE_BY_NAME } from "../core/card-service.js";
-import { initEmbeddings } from "../core/embeddings.js";
-import { cardMaturity } from "../core/scheduler.js";
-import {
-  startSession,
-  getNextCard,
-  submitReview,
-} from "../core/session-service.js";
-import {
-  getFullStats,
-  getMaturityReport,
-} from "../core/analytics-service.js";
-import type { Grade } from "ts-fsrs";
+import { Command, Option } from "commander";
 import { createInterface } from "readline";
 import { readFileSync, writeFileSync } from "fs";
+import { createClient, databaseFile, setDb } from "../db/client.js";
+import { prepareDatabase } from "../db/prepare.js";
+import { listDeckStats, getDeckByName, getOrCreateDeck } from "../core/deck-service.js";
+import { CARD_STATE_NAMES } from "../core/types.js";
+import {
+  createCard,
+  searchCards,
+  backfillEmbeddings,
+  updateCard,
+  listCards,
+  embeddingCoverage,
+  listCategories,
+  setDeckCategory,
+} from "../core/card-service.js";
+import { initEmbeddings } from "../core/embeddings.js";
+import { cardMaturity, isGrade } from "../core/scheduler.js";
+import type { Grade } from "ts-fsrs";
+import {
+  startSession,
+  getNextCardOrBlock,
+  getQueuePosition,
+  submitReview,
+  endSession,
+} from "../core/session-service.js";
+import { leechBlockError } from "../core/leeches.js";
+import { getFullStats, getMaturityReport } from "../core/analytics-service.js";
 import { parseAnkiTxt, importTxtNotes, exportCardsToAnkiTxt } from "../core/anki-io.js";
-import { exportToApkg, importFromApkg, importApkgCards } from "../core/anki-apkg.js";
+import { exportCardsToApkg, importApkgFile, isApkgPath } from "../core/anki-apkg.js";
+import type { ImportResult } from "../core/card-import.js";
 import { dumpDatabase, restoreDatabase } from "../core/db-dump.js";
 import { checkCalibration } from "../core/calibration.js";
-import { getOverview } from "../app/overview.js";
+import { getOverview } from "../core/overview.js";
+import { localDay } from "../core/days.js";
+import { PACKAGE_VERSION } from "../core/version.js";
 
-function defaultDbPath(): string {
-  const url = process.env["DATABASE_URL"] ?? "file:./prisma/master.db";
-  return url.startsWith("file:") ? url.slice("file:".length) : url;
-}
-
-// Initialize Prisma
 const prisma = createClient();
 setDb(prisma);
 
@@ -40,12 +46,32 @@ const program = new Command();
 program
   .name("master")
   .description("Self-improving spaced repetition learning system")
-  .version("0.1.0");
+  .version(PACKAGE_VERSION);
+
+// Errors thrown from an action are printed by the run at the bottom, which
+// exits non-zero; actions never call process.exit, so the client disconnects.
+
+async function requireDeck(name: string) {
+  const deck = await getDeckByName(name);
+  if (deck == null) {
+    throw new Error(`Deck "${name}" not found. Run \`master decks\` to see available decks.`);
+  }
+  return deck;
+}
+
+/** An integer option of at least `min`, or a clean error naming the flag. */
+function intOption(value: string, flag: string, min: number): number {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < min) {
+    throw new Error(`${flag} must be a whole number of at least ${min}, got "${value}"`);
+  }
+  return n;
+}
 
 // --- init ---
 program
   .command("init")
-  .description("Initialize database with default topic decks")
+  .description("Create the default decks (the database itself is made by every start)")
   .action(async () => {
     const defaultDecks = [
       { name: "React", description: "React fundamentals and patterns" },
@@ -58,21 +84,9 @@ program
     ];
 
     for (const deck of defaultDecks) {
-      try {
-        await createDeck(deck.name, deck.description);
-        console.log(`  Created deck: ${deck.name}`);
-      } catch {
-        console.log(`  Deck already exists: ${deck.name}`);
-      }
+      await getOrCreateDeck(deck.name, deck.description);
+      console.log(`  Deck: ${deck.name}`);
     }
-
-    // Ensure default config exists
-    const db = prisma;
-    await db.config.upsert({
-      where: { id: "default" },
-      create: { id: "default" },
-      update: {},
-    });
 
     console.log("\nInitialization complete.");
   });
@@ -82,16 +96,15 @@ program
   .command("decks")
   .description("List all decks with stats")
   .action(async () => {
-    const decks = await listDecks();
+    const decks = await listDeckStats();
     if (decks.length === 0) {
       console.log("No decks. Run `master init` to create default decks.");
       return;
     }
 
     console.log("\nDecks:\n");
-    for (const deck of decks) {
-      const stats = await getDeckStats(deck.id);
-      console.log(`  ${deck.name} (${stats.totalCards} cards)`);
+    for (const stats of decks) {
+      console.log(`  ${stats.name} (${stats.totalCards} cards)`);
       console.log(
         `    Due: ${stats.dueCards} | New: ${stats.newCards} | Learning: ${stats.learningCards} | Review: ${stats.reviewCards} | Relearning: ${stats.relearningCards}`
       );
@@ -111,98 +124,75 @@ cardsCmd
   .requiredOption("-f, --front <text>", "Card front (question)")
   .requiredOption("-b, --back <text>", "Card back (answer)")
   .option("-t, --tags <tags>", "Comma-separated tags")
-  .option("--type <type>", "Card type: guided or unguided", "guided")
+  .addOption(new Option("--type <type>", "Card type").choices(["guided", "unguided"]).default("guided"))
   .option("-c, --category <name>", "Card category")
-  .action(async (deckName: string, opts) => {
-    const deck = await getDeckByName(deckName);
-    if (!deck) {
-      console.error(`Deck "${deckName}" not found. Run \`master decks\` to see available decks.`);
-      process.exit(1);
+  .action(
+    async (
+      deckName: string,
+      opts: { front: string; back: string; tags?: string; type: "guided" | "unguided"; category?: string }
+    ) => {
+      const deck = await requireDeck(deckName);
+
+      const { card, duplicateWarning } = await createCard({
+        deckId: deck.id,
+        front: opts.front,
+        back: opts.back,
+        tags: opts.tags?.split(",").map((t) => t.trim()),
+        type: opts.type,
+        category: opts.category,
+        checkDuplicates: true,
+      });
+
+      if (duplicateWarning?.isDuplicate === true) {
+        console.log(`\n  Warning: ${duplicateWarning.reason}`);
+      }
+      const front = card.front.length > 50 ? `${card.front.slice(0, 50)}...` : card.front;
+      console.log(`  Card added to ${deckName}: "${front}"`);
     }
-
-    const category = typeof opts.category === "string" ? opts.category : undefined;
-
-    const { card, duplicateWarning } = await createCard({
-      deckId: deck.id,
-      front: opts.front,
-      back: opts.back,
-      tags: opts.tags ? opts.tags.split(",").map((t: string) => t.trim()) : undefined,
-      type: opts.type,
-      category,
-      checkDuplicates: true,
-    });
-
-    if (duplicateWarning?.isDuplicate) {
-      console.log(`\n  Warning: ${duplicateWarning.reason}`);
-    }
-    console.log(`  Card added to ${deckName}: "${card.front.slice(0, 50)}..."`);
-  });
+  );
 
 cardsCmd
   .command("list")
-  .description("List cards")
+  .description("List cards, soonest due first")
   .option("-d, --deck <deck>", "Filter by deck name")
   .option("-c, --category <name>", "Filter by category")
   .option("--uncategorized", "Show only cards with no category")
-  .option("--due", "Show only due cards")
-  .option("--state <name>", "Filter by FSRS state: new | learning | review | relearning")
-  .option("--limit <n>", "Max rows to return (default 50, max 200)")
-  .action(async (opts) => {
-    const db = prisma;
-    let deckId: string | undefined;
-    if (opts.deck) {
-      const deck = await getDeckByName(opts.deck);
-      if (!deck) {
-        console.error(`Deck "${opts.deck}" not found.`);
-        process.exit(1);
+  .option("--due", "Show only cards due now (not suspended)")
+  .addOption(new Option("--state <name>", "Filter by FSRS state").choices(CARD_STATE_NAMES))
+  .option("--limit <n>", "Max rows to return (default 50, max 200)", "50")
+  .action(
+    async (opts: {
+      deck?: string;
+      category?: string;
+      uncategorized?: boolean;
+      due?: boolean;
+      state?: string;
+      limit: string;
+    }) => {
+      const deck = opts.deck != null ? await requireDeck(opts.deck) : undefined;
+      const cards = await listCards({
+        deckId: deck?.id,
+        category: opts.uncategorized === true ? "__uncategorized__" : opts.category,
+        state: opts.state,
+        due: opts.due === true,
+        orderBy: "due",
+        limit: intOption(opts.limit, "--limit", 1),
+      });
+
+      if (cards.length === 0) {
+        console.log("No cards found.");
+        return;
       }
-      deckId = deck.id;
-    }
 
-    const where: Record<string, unknown> = {};
-    if (deckId) where.deckId = deckId;
-    if (opts.due) where.due = { lte: new Date() };
-    if (opts.uncategorized === true) where.category = null;
-    else if (typeof opts.category === "string" && opts.category !== "") {
-      where.category = opts.category;
-    }
-    if (typeof opts.state === "string" && opts.state !== "") {
-      if (!(opts.state in CARD_STATE_BY_NAME)) {
-        console.error(
-          `Invalid --state "${opts.state}". Expected one of: ${Object.keys(CARD_STATE_BY_NAME).join(", ")}`
-        );
-        process.exit(1);
+      console.log(`\n${cards.length} cards:\n`);
+      for (const card of cards) {
+        const state = CARD_STATE_NAMES[card.state] ?? "?";
+        const cat = card.category != null ? ` {${card.category}}` : "";
+        console.log(`  [${state}] ${card.front.slice(0, 60)} (${card.deck.name})${cat} - ${cardMaturity(card)}`);
       }
-      where.state = CARD_STATE_BY_NAME[opts.state];
+      console.log();
     }
-
-    const rawLimit = opts.limit != null ? Number(opts.limit) : 50;
-    const take = Math.max(1, Math.min(Number.isFinite(rawLimit) ? rawLimit : 50, 200));
-
-    const cards = await db.card.findMany({
-      where,
-      include: { deck: { select: { name: true } } },
-      take,
-      orderBy: { due: "asc" },
-    });
-
-    if (cards.length === 0) {
-      console.log("No cards found.");
-      return;
-    }
-
-    const stateLabels = Object.entries(CARD_STATE_BY_NAME)
-      .sort(([, a], [, b]) => a - b)
-      .map(([k]) => k[0].toUpperCase() + k.slice(1));
-
-    console.log(`\n${cards.length} cards:\n`);
-    for (const card of cards) {
-      const state = stateLabels[card.state] ?? "?";
-      const cat = card.category != null ? ` {${card.category}}` : "";
-      console.log(`  [${state}] ${card.front.slice(0, 60)} (${card.deck.name})${cat} - ${cardMaturity(card)}`);
-    }
-    console.log();
-  });
+  );
 
 cardsCmd
   .command("search <query>")
@@ -231,12 +221,7 @@ categoriesCmd
   .command("list")
   .description("List all categories in use, with card counts")
   .action(async () => {
-    const db = prisma;
-    const rows = await db.card.groupBy({
-      by: ["category"],
-      _count: { _all: true },
-    });
-
+    const rows = await listCategories();
     if (rows.length === 0) {
       console.log("No cards yet.");
       return;
@@ -244,8 +229,7 @@ categoriesCmd
 
     console.log("\nCategories:\n");
     for (const row of rows) {
-      const label = row.category ?? "(uncategorized)";
-      console.log(`  ${label}: ${row._count._all} card(s)`);
+      console.log(`  ${row.category ?? "(uncategorized)"}: ${row.cards} card(s)`);
     }
     console.log();
   });
@@ -256,46 +240,36 @@ categoriesCmd
   .option("-d, --deck <deck>", "Deck name: apply to all cards in this deck")
   .option("--card <id>", "Card id: apply to a single card")
   .action(async (name: string, opts: { deck?: string; card?: string }) => {
-    const hasCard = opts.card != null && opts.card !== "";
-    const hasDeck = opts.deck != null && opts.deck !== "";
-    if (hasCard === hasDeck) {
-      console.error("Specify exactly one of --card <id> or --deck <name>.");
-      process.exit(1);
+    if ((opts.card != null) === (opts.deck != null)) {
+      throw new Error("Specify exactly one of --card <id> or --deck <name>.");
     }
 
-    if (hasCard) {
-      await updateCard(opts.card!, { category: name });
-      console.log(`  Set category "${name}" on card ${opts.card!}`);
+    if (opts.card != null) {
+      await updateCard(opts.card, { category: name });
+      console.log(`  Set category "${name}" on card ${opts.card}`);
       return;
     }
 
-    const deck = await getDeckByName(opts.deck!);
-    if (!deck) {
-      console.error(`Deck "${opts.deck!}" not found.`);
-      process.exit(1);
-    }
-    const res = await prisma.card.updateMany({
-      where: { deckId: deck.id },
-      data: { category: name },
-    });
-    console.log(`  Set category "${name}" on ${res.count} card(s) in deck ${opts.deck!}`);
+    const deck = await requireDeck(opts.deck!);
+    const count = await setDeckCategory(deck.id, name);
+    console.log(`  Set category "${name}" on ${count} card(s) in deck ${deck.name}`);
   });
 
 // --- study ---
 program
   .command("study")
   .description("Start an interactive study session")
-  .option("-d, --deck <deck>", "Focus on a specific deck")
+  .option("-d, --deck <deck>", "Only study cards of this deck")
   .option("-c, --category <name>", "Only study cards of this category")
-  .option("-l, --limit <n>", "Max cards", "20")
-  .action(async (opts) => {
-    const category = typeof opts.category === "string" && opts.category !== ""
-      ? opts.category
-      : undefined;
+  .option("-l, --limit <n>", "Max review cards (new cards stay capped at 5)", "20")
+  .action(async (opts: { deck?: string; category?: string; limit: string }) => {
+    const limit = intOption(opts.limit, "--limit", 1);
+    const deck = opts.deck != null ? await requireDeck(opts.deck) : undefined;
     const session = await startSession({
-      maxNewCardsPerSession: Math.min(parseInt(opts.limit), 5),
-      maxReviewCardsPerSession: parseInt(opts.limit),
-      category,
+      maxNewCardsPerSession: Math.min(limit, 5),
+      maxReviewCardsPerSession: limit,
+      category: opts.category,
+      deckId: deck?.id,
     });
 
     if (session.queue.length === 0) {
@@ -306,35 +280,56 @@ program
     console.log(`\nStudy session started. ${session.queue.length} cards in queue.\n`);
 
     const rl = createInterface({ input: process.stdin, output: process.stdout });
-    const ask = (q: string): Promise<string> =>
-      new Promise((resolve) => rl.question(q, resolve));
+    rl.on("SIGINT", () => rl.close());
+    // Lines are buffered, so piped answers are not lost between prompts. Null
+    // once the input is closed (Ctrl+C, Ctrl+D, end of a pipe).
+    const lines = rl[Symbol.asyncIterator]();
+    const ask = async (prompt: string): Promise<string | null> => {
+      process.stdout.write(prompt);
+      const line = await lines.next();
+      return line.done === true ? null : line.value;
+    };
 
     let reviewed = 0;
-    let card = await getNextCard(session.id);
-    while (card != null) {
-      reviewed++;
-      console.log(`--- Card ${reviewed}/${session.queue.length} ---`);
-      console.log(`\n  ${card.front}\n`);
+    try {
+      study: for (;;) {
+        const next = await getNextCardOrBlock(session.id);
+        if (next == null) break;
+        if ("blocked" in next) {
+          console.log(`\n${leechBlockError(next.blocked).message}\n`);
+          break;
+        }
 
-      await ask("  [Press Enter to reveal answer] ");
-      console.log(`\n  ${card.back}\n`);
+        const { card } = next;
+        const position = await getQueuePosition(session.id);
+        if (position != null) {
+          console.log(`--- Card ${position.position}/${position.total}${position.repeat ? " (again)" : ""} ---`);
+        }
+        console.log(`\n  ${card.front}\n`);
 
-      let rating: Grade | null = null;
-      while (rating === null) {
-        const input = await ask("  Rate: (1) Again  (2) Hard  (3) Good  (4) Easy  > ");
-        const n = parseInt(input.trim());
-        if (n >= 1 && n <= 4) rating = n as Grade;
+        if ((await ask("  [Press Enter to reveal answer] ")) === null) break;
+        console.log(`\n  ${card.back}\n`);
+
+        let rating: Grade | undefined;
+        while (rating === undefined) {
+          const answer = await ask("  Rate: (1) Again  (2) Hard  (3) Good  (4) Easy  > ");
+          if (answer === null) break study;
+          const n = Number(answer.trim());
+          if (isGrade(n)) rating = n;
+        }
+
+        await submitReview(session.id, card.id, rating);
+        reviewed++;
+        console.log();
       }
-
-      await submitReview(session.id, card.id, rating);
-      console.log();
-      card = await getNextCard(session.id);
+    } finally {
+      rl.close();
+      // A session that reviewed nothing is discarded at the next start instead.
+      if (reviewed > 0) await endSession(session.id);
     }
 
     console.log(`\n--- Session Complete ---`);
     console.log(`  Cards reviewed: ${reviewed}`);
-
-    rl.close();
   });
 
 // --- stats ---
@@ -378,9 +373,8 @@ program
     if (recentSessions.length > 0) {
       console.log("  Recent sessions:");
       for (const s of recentSessions) {
-        const date = s.startTime.toISOString().split("T")[0];
         console.log(
-          `    ${date}: ${s.cardsReviewed} cards, ${(s.accuracy * 100).toFixed(0)}% accuracy`
+          `    ${localDay(s.startTime)}: ${s.cardsReviewed} cards, ${(s.accuracy * 100).toFixed(0)}% accuracy`
         );
       }
       console.log();
@@ -404,13 +398,14 @@ program
   .option("--pending <n>", "How many pending cards to list", "8")
   .action(async (opts: { pending: string }) => {
     // stdout is a machine interface, as for `calibration`: the JSON and nothing else.
-    console.log(JSON.stringify(await getOverview({ pendingLimit: Number(opts.pending) })));
+    const pendingLimit = intOption(opts.pending, "--pending", 0);
+    console.log(JSON.stringify(await getOverview({ pendingLimit })));
   });
 
-// --- topics ---
+// --- maturity ---
 program
-  .command("topics")
-  .description("Show topic maturity report")
+  .command("maturity")
+  .description("Show how far each deck has matured (new, learning, familiar, internalized)")
   .action(async () => {
     const maturity = await getMaturityReport();
     if (maturity.length === 0) {
@@ -418,7 +413,7 @@ program
       return;
     }
 
-    console.log("\n--- Topic Maturity ---\n");
+    console.log("\n--- Deck Maturity ---\n");
     for (const m of maturity) {
       const pctInternalized =
         m.total > 0
@@ -435,74 +430,39 @@ program
   });
 
 // --- import ---
+function printImport(result: ImportResult, dryRun: boolean): void {
+  const counts = `${result.created} created, ${result.updated} updated, ${result.duplicates} duplicates, ${result.invalid} invalid`;
+  console.log(`\n  ${dryRun ? "Would import" : "Imported"}: ${counts}`);
+  if (result.invalid > 0) {
+    console.log("  Invalid: an empty front, or content the card rules reject (try one with `master cards add`).");
+  }
+}
+
 program
   .command("import <file>")
-  .description("Import cards from Anki (.apkg with scheduling, or .txt plain text)")
-  .option("-d, --deck <deck>", "Target deck name (required for .txt, ignored for .apkg)")
-  .option("--dry-run", "Show what would be imported without creating cards")
+  .description("Import cards from Anki (.apkg/.colpkg with scheduling, or .txt plain text)")
+  .option("-d, --deck <deck>", "Target deck for .txt (default: the deck the file names); ignored for .apkg")
+  .option("--dry-run", "Show what would be imported without writing anything")
   .option("--ours", "On duplicate: keep local version (default)")
   .option("--theirs", "On duplicate: overwrite local with imported version")
-  .action(async (file: string, opts) => {
+  .action(async (file: string, opts: { deck?: string; dryRun?: boolean; ours?: boolean; theirs?: boolean }) => {
     if (opts.ours === true && opts.theirs === true) {
-      console.error("Error: --ours and --theirs are mutually exclusive");
-      process.exit(1);
+      throw new Error("--ours and --theirs are mutually exclusive");
     }
-    const conflict: "ours" | "theirs" = opts.theirs === true ? "theirs" : "ours";
-    const action = opts.dryRun === true ? "Would import" : "Imported";
+    const importOpts = { conflict: opts.theirs === true ? "theirs" : "ours", dryRun: opts.dryRun === true } as const;
 
-    const isApkg = file.endsWith(".apkg") || file.endsWith(".colpkg");
-
-    if (isApkg) {
-      // --- .apkg import (full scheduling) ---
-      const imported = await importFromApkg(file);
-      let totalCreated = 0;
-      let totalUpdated = 0;
-      let totalSkipped = 0;
-
-      for (const importDeck of imported.decks) {
-        const deck = await getOrCreateDeck(importDeck.name);
-        const result = await importApkgCards(
-          importDeck.cards,
-          deck.id,
-          { conflict, dryRun: opts.dryRun }
-        );
-        totalCreated += result.created;
-        totalUpdated += result.updated;
-        totalSkipped += result.skipped;
-      }
-
-      const updatedPart = totalUpdated > 0 ? ` | Updated: ${totalUpdated}` : "";
-      console.log(
-        `\n  ${action}: ${totalCreated} cards across ${imported.decks.length} deck(s)${updatedPart} | Skipped: ${totalSkipped}`
-      );
-      console.log("  Scheduling data preserved (SM-2 → FSRS conversion applied).");
-    } else {
-      // --- .txt import (plain text, no scheduling) ---
-      if (!opts.deck) {
-        console.error("--deck is required for .txt imports. Use: master import file.txt -d DeckName");
-        process.exit(1);
-      }
-
-      const content = readFileSync(file, "utf-8");
-      const notes = parseAnkiTxt(content);
-
-      if (notes.length === 0) {
-        console.log("No notes found in file.");
-        return;
-      }
-
-      const deck = await getOrCreateDeck(opts.deck);
-      const { created, updated, duplicates, skipped } = await importTxtNotes(
-        notes,
-        deck.id,
-        { conflict, dryRun: opts.dryRun }
-      );
-
-      const updatedPart = updated > 0 ? ` | Updated: ${updated}` : "";
-      console.log(
-        `\n  ${action}: ${created} cards${updatedPart} | Skipped: ${duplicates} | Invalid: ${skipped}`
-      );
+    if (isApkgPath(file)) {
+      printImport(await importApkgFile(file, importOpts), importOpts.dryRun);
+      console.log("  Scheduling and review history kept (SM-2 converted to FSRS where Anki had no FSRS data).");
+      return;
     }
+
+    const notes = parseAnkiTxt(readFileSync(file, "utf-8"));
+    if (notes.length === 0) {
+      console.log("No notes found in file.");
+      return;
+    }
+    printImport(await importTxtNotes(notes, { ...importOpts, deck: opts.deck }), importOpts.dryRun);
   });
 
 // --- export ---
@@ -510,77 +470,26 @@ program
   .command("export <file>")
   .description("Export cards (.apkg with scheduling, or .txt plain text)")
   .option("-d, --deck <deck>", "Export only this deck (default: all)")
-  .action(async (file: string, opts) => {
-    const isApkg = file.endsWith(".apkg");
-    const db = prisma;
+  .action(async (file: string, opts: { deck?: string }) => {
+    const deck = opts.deck != null ? await requireDeck(opts.deck) : undefined;
 
-    const where: Record<string, unknown> = {};
-    let deckFilter: Awaited<ReturnType<typeof getDeckByName>> | null = null;
-    if (opts.deck) {
-      deckFilter = await getDeckByName(opts.deck);
-      if (!deckFilter) {
-        console.error(`Deck "${opts.deck}" not found.`);
-        process.exit(1);
+    if (isApkgPath(file)) {
+      if (!/\.apkg$/i.test(file)) {
+        throw new Error("Export writes a deck package: name the file .apkg (a .colpkg would replace Anki's whole collection)");
       }
-      where.deckId = deckFilter.id;
-    }
-
-    if (isApkg) {
-      // --- .apkg export (full scheduling) ---
-      const decks = deckFilter ? [deckFilter] : await db.deck.findMany();
-
-      const exportDecks = [];
-      for (const deck of decks) {
-        const cards = await db.card.findMany({
-          where: { deckId: deck.id },
-          include: { reviews: true },
-        });
-
-        if (cards.length === 0) continue;
-
-        exportDecks.push({
-          deckName: deck.name,
-          cards: cards.map((c) => ({
-            id: c.id,
-            front: c.front,
-            back: c.back,
-            tags: parseTags(c.tags),
-            stability: c.stability,
-            difficulty: c.difficulty,
-            state: c.state,
-            reps: c.reps,
-            lapses: c.lapses,
-            due: c.due,
-            interval: c.interval,
-            reviews: c.reviews.map((r) => ({
-              rating: r.rating,
-              reviewedAt: r.reviewedAt,
-              responseMs: r.responseMs ?? 0,
-              stability: r.stability,
-              difficulty: r.difficulty,
-            })),
-          })),
-        });
-      }
-
-      await exportToApkg(file, exportDecks);
-      const totalCards = exportDecks.reduce((n, d) => n + d.cards.length, 0);
-      console.log(`  Exported ${totalCards} cards across ${exportDecks.length} deck(s) to ${file}`);
+      const { cardCount, deckCount } = await exportCardsToApkg(file, deck?.id);
+      console.log(`  Exported ${cardCount} cards across ${deckCount} deck(s) to ${file}`);
       console.log("  Scheduling data preserved (FSRS → SM-2 conversion applied).");
-    } else {
-      const deckId = opts.deck
-        ? (await getDeckByName(opts.deck))?.id
-        : undefined;
-      const result = await exportCardsToAnkiTxt(deckId);
-
-      if (result.cardCount === 0) {
-        console.log("No cards to export.");
-        return;
-      }
-
-      writeFileSync(file, result.content, "utf-8");
-      console.log(`  Exported ${result.cardCount} cards to ${file}`);
+      return;
     }
+
+    const result = await exportCardsToAnkiTxt(deck?.id);
+    if (result.cardCount === 0) {
+      console.log("No cards to export.");
+      return;
+    }
+    writeFileSync(file, result.content, "utf-8");
+    console.log(`  Exported ${result.cardCount} cards to ${file}`);
   });
 
 // --- embeddings ---
@@ -590,12 +499,9 @@ embCmd
   .command("status")
   .description("Show embedding coverage")
   .action(async () => {
-    const [total, withEmbeddings] = await Promise.all([
-      prisma.card.count(),
-      prisma.card.count({ where: { embedding: { not: null } } }),
-    ]);
-    const coverage = total > 0 ? `${((withEmbeddings / total) * 100).toFixed(0)}%` : "0%";
-    console.log(`\n  Embeddings: ${withEmbeddings}/${total} cards (${coverage})\n`);
+    const { total, embedded } = await embeddingCoverage();
+    const coverage = total > 0 ? `${((embedded / total) * 100).toFixed(0)}%` : "0%";
+    console.log(`\n  Embeddings: ${embedded}/${total} cards (${coverage})\n`);
   });
 
 embCmd
@@ -612,13 +518,13 @@ embCmd
     console.log(`\n  Done: ${processed} embeddings generated, ${failed} failed.\n`);
   });
 
-// --- db:dump / db:restore ---
+// --- db:dump / db:restore / db:sync ---
 program
   .command("db:dump <file>")
   .description("Export full database as a portable SQL dump")
   .option("--source <path>", "Source DB path (defaults to DATABASE_URL)")
   .action((file: string, opts: { source?: string }) => {
-    const src = opts.source ?? defaultDbPath();
+    const src = opts.source ?? databaseFile();
     const result = dumpDatabase(src, file);
     console.log(`  Dumped ${result.rows} rows across ${result.tables} table(s) from ${src} → ${file}`);
   });
@@ -629,18 +535,17 @@ program
   .option("--target <path>", "Target DB path (defaults to DATABASE_URL)")
   .option("--force", "Overwrite target if it already exists")
   .action((file: string, opts: { target?: string; force?: boolean }) => {
-    const target = opts.target ?? defaultDbPath();
+    const target = opts.target ?? databaseFile();
     const result = restoreDatabase(target, file, { force: opts.force === true });
     console.log(`  Restored ${result.rows} rows across ${result.tables} table(s) from ${file} → ${target}`);
   });
 
-// --- db-sync ---
 // Every start already syncs the schema (prepareDatabase, below); this says
 // what that start did, and is how a script makes a database ready and
 // stamped without doing anything else (Omvida's fixture deck).
 let schemaPushed = false;
 program
-  .command("db-sync")
+  .command("db:sync")
   .description("Bring the database's tables up to prisma/schema.prisma (every start does this too)")
   .action(() => {
     console.log(schemaPushed ? "  Schema pushed (the old database was backed up beside it)" : "  Schema already in sync");
@@ -650,4 +555,8 @@ program
 void prepareDatabase(prisma)
   .then((r) => { schemaPushed = r.schemaPushed; })
   .then(() => program.parseAsync(process.argv))
-  .then(() => prisma.$disconnect());
+  .catch((err: unknown) => {
+    console.error(err instanceof Error ? err.message : err);
+    process.exitCode = 1;
+  })
+  .finally(() => prisma.$disconnect());

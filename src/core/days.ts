@@ -6,6 +6,8 @@
  * day a review belongs to. Every day key in this package comes from here.
  */
 
+export const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
 export function systemTimeZone(): string {
   return Intl.DateTimeFormat().resolvedOptions().timeZone;
 }
@@ -21,4 +23,13 @@ export function localDay(d: Date, timeZone: string = systemTimeZone()): string {
     formatters.set(timeZone, f);
   }
   return f.format(d);
+}
+
+/**
+ * Local midnight starting the day `daysBack` days before `d`'s, in the
+ * process's time zone (the zone `localDay` defaults to). A calendar step, not
+ * `daysBack * MS_PER_DAY`, so a DST change in between moves nothing.
+ */
+export function startOfLocalDay(d: Date, daysBack = 0): Date {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() - daysBack);
 }

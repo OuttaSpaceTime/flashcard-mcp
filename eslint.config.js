@@ -3,11 +3,11 @@ import tsPlugin from "@typescript-eslint/eslint-plugin";
 
 export default [
   {
-    files: ["src/**/*.ts"],
+    files: ["src/**/*.ts", "__tests__/**/*.ts"],
     languageOptions: {
       parser: tsParser,
       parserOptions: {
-        project: "./tsconfig.json",
+        project: "./tsconfig.test.json",
       },
     },
     plugins: {
@@ -61,6 +61,6 @@ export default [
     },
   },
   {
-    ignores: ["build/**", "node_modules/**", "__tests__/**", "*.config.*"],
+    ignores: ["build/**", "node_modules/**", "*.config.*"],
   },
 ];

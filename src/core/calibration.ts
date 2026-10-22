@@ -1,5 +1,5 @@
 import { getDb } from "../db/client.js";
-import { localDay, systemTimeZone } from "./days.js";
+import { localDay, MS_PER_DAY, systemTimeZone } from "./days.js";
 
 /**
  * Study calibration — true retention, rating discrimination, difficulty verdict.
@@ -82,8 +82,6 @@ const RATING_NAMES: Record<number, keyof RatingMix> = {
   4: "easy",
 };
 
-const MS_PER_DAY = 24 * 60 * 60 * 1000;
-
 function pct(value: number): string {
   return `${Math.round(value * 100)}%`;
 }
@@ -95,6 +93,15 @@ function pct(value: number): string {
  * not UTC. A study day is a local day: bucketing a UTC+2 developer's reviews by
  * UTC date would split everything before 02:00 local into the previous day, so a
  * lapse and its retest would count as two separate days instead of one.
+ *
+ * One exception, kept on purpose: the `elapsedDays >= 1` filter reads the
+ * stored `Review.elapsedDays`, which ts-fsrs counts in UTC calendar days. Near
+ * local midnight in a non-UTC zone the two rules can disagree on whether a
+ * review is same-day: for UTC+2, a review at 01:00 after one at 23:00 the
+ * evening before falls on the next local day but the same UTC day, so it is
+ * dropped as a same-day repeat. The report is a wire format whose numbers the
+ * study repo tracks over time, so the metric stays as Anki computes it rather
+ * than shifting under that history.
  */
 export function eligibleReviews(
   rows: CalibrationReview[],

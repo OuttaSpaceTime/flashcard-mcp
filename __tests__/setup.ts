@@ -1,11 +1,12 @@
-import { execSync } from "child_process";
+import { afterAll, beforeAll, beforeEach } from "vitest";
 import { mkdtempSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { createClient, setDb } from "../src/db/client.js";
+import { syncSchema } from "../src/db/schema-sync.js";
 import type { PrismaClient } from "@prisma/client";
 
-let testDbPath: string;
+let tempDir: string;
 let testPrisma: PrismaClient;
 
 beforeEach(async () => {
@@ -20,27 +21,16 @@ beforeEach(async () => {
 });
 
 beforeAll(async () => {
-  const tempDir = mkdtempSync(join(tmpdir(), "master-dev-test-"));
-  testDbPath = join(tempDir, "test.db");
-  const dbUrl = `file:${testDbPath}`;
-
-  execSync("npx prisma db push", {
-    env: { ...process.env, DATABASE_URL: dbUrl },
-    stdio: "pipe",
-  });
-
-  testPrisma = createClient(dbUrl);
+  tempDir = mkdtempSync(join(tmpdir(), "flashcard-mcp-test-"));
+  // Built the way every start builds the real database (src/db/prepare.ts).
+  testPrisma = createClient(`file:${join(tempDir, "test.db")}`);
+  await syncSchema(testPrisma);
   setDb(testPrisma);
 });
 
 afterAll(async () => {
-  await testPrisma?.$disconnect();
-  try {
-    rmSync(testDbPath, { force: true });
-    rmSync(testDbPath + "-journal", { force: true });
-  } catch {
-    // cleanup best-effort
-  }
+  await testPrisma.$disconnect();
+  rmSync(tempDir, { recursive: true, force: true });
 });
 
 export function getTestDb(): PrismaClient {

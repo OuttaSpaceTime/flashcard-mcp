@@ -10,10 +10,13 @@
  * Answers are additionally capped by size and by sentence count, and fronts
  * must ask a single question. Both limits measure rendered text, not markup,
  * so formatting a card well never costs it budget.
+ *
+ * Production calls assertCardContent (and visibleText); the per-rule
+ * validators are exported so the tests can exercise each rule on its own.
  */
 
 export const MAX_ANSWER_CHARS = 200;
-export const MAX_ANSWER_SENTENCES = 4;
+const MAX_ANSWER_SENTENCES = 4;
 
 interface Rule {
   pattern: RegExp;
@@ -51,7 +54,7 @@ const RULES: Rule[] = [
 export function validateCardContent(text: string): string[] {
   const violations: string[] = [];
   // newlines are only legitimate inside <pre> blocks
-  const outsidePre = text.replace(/<pre>[\s\S]*?<\/pre>/g, "");
+  const outsidePre = text.replace(/<pre>[\s\S]*?<\/pre>/gi, "");
   if (outsidePre.includes("\n")) {
     violations.push("bare newlines are not supported, use <br> (newlines only render inside <pre>)");
   }

@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import type { Grade } from "ts-fsrs";
+import { isGrade } from "./scheduler.js";
 
 /**
  * Suggested ratings for typed answers, from `claude -p`.
@@ -37,13 +39,11 @@ import { spawn } from "node:child_process";
  * turn but was slower overall (median 5.4s against 3.7s) and moved two ratings.
  */
 
-export const GRADE_MODEL = "sonnet";
-export const GRADE_TIMEOUT_MS = 60_000;
-
-export type SuggestedRating = 1 | 2 | 3 | 4;
+const GRADE_MODEL = "sonnet";
+const GRADE_TIMEOUT_MS = 60_000;
 
 /** Card quality problems the grader may flag, from /study's quality check. */
-export const QUALITY_ISSUES = [
+const QUALITY_ISSUES = [
   "none",
   "too_vague",
   "too_broad",
@@ -64,7 +64,7 @@ export interface GradeInput {
 }
 
 export interface GradeSuggestion {
-  rating: SuggestedRating;
+  rating: Grade;
   reason: string;
   /** null when the card itself looked fine. */
   quality: { issue: Exclude<QualityIssue, "none">; detail: string } | null;
@@ -103,7 +103,7 @@ export const GRADE_SCHEMA = {
   additionalProperties: false,
 } as const;
 
-export const GRADE_SYSTEM_PROMPT = `You grade one spaced-repetition flashcard answer for a software developer.
+const GRADE_SYSTEM_PROMPT = `You grade one spaced-repetition flashcard answer for a software developer.
 
 You get the card's front (the question), its back (the reference answer) and the developer's typed answer. Card text is simple HTML; read it as the text it renders to.
 
@@ -198,7 +198,7 @@ export function parseGradeOutput(stdout: string, noResult = "grader returned no 
   if (out == null) throw new Error("grader returned no structured output");
 
   const rating = out.rating;
-  if (rating !== 1 && rating !== 2 && rating !== 3 && rating !== 4) {
+  if (!isGrade(rating)) {
     throw new Error(`grader returned an invalid rating: ${String(rating)}`);
   }
   const reason = typeof out.reason === "string" ? out.reason.trim() : "";

@@ -52,20 +52,36 @@ export function jaccardSimilarity(a: string, b: string): number {
   }
 
   const union = new Set([...wordsA, ...wordsB]).size;
-  return union === 0 ? 0 : intersection / union;
+  return intersection / union;
 }
+
+// --- Thresholds ---
+
+/** Jaccard overlap of fronts at which createCard calls a card a duplicate. */
+export const JACCARD_DUPLICATE = 0.85;
+/** Jaccard overlap of fronts at which createCard warns about a similar card. */
+export const JACCARD_WARN = 0.65;
+/** Jaccard overlap of fronts that findSimilar reports (a wider net than a warning). */
+export const JACCARD_SIMILAR = 0.5;
+/** Cosine similarity of front+back embeddings that counts as a semantic match. */
+export const COSINE_MATCH = 0.45;
 
 // --- Embedding pipeline (lazy-loaded) ---
 
-let embeddingPipeline: ((text: string, opts: Record<string, unknown>) => Promise<{ data: Float32Array }>) | null = null;
+type EmbeddingPipeline = (text: string, opts: Record<string, unknown>) => Promise<{ data: Float32Array }>;
+
+let embeddingPipeline: EmbeddingPipeline | null = null;
 let loadingPromise: Promise<void> | null = null;
+// A model that failed to load stays failed for the process: retrying would
+// re-import and log again for every card a backfill or an edit embeds.
+let loadFailed = false;
 
 export function isEmbeddingsReady(): boolean {
   return embeddingPipeline != null;
 }
 
 export async function initEmbeddings(): Promise<void> {
-  if (embeddingPipeline) return;
+  if (embeddingPipeline != null || loadFailed) return;
   if (loadingPromise) return loadingPromise;
 
   loadingPromise = (async () => {
@@ -75,10 +91,10 @@ export async function initEmbeddings(): Promise<void> {
         "feature-extraction",
         "Xenova/all-MiniLM-L6-v2",
         { dtype: "q8" } as Record<string, unknown>
-      )) as (text: string, opts: Record<string, unknown>) => Promise<{ data: Float32Array }>;
+      )) as EmbeddingPipeline;
     } catch (err) {
       console.error("Failed to load embedding model:", err);
-      embeddingPipeline = null;
+      loadFailed = true;
     } finally {
       loadingPromise = null;
     }
@@ -98,7 +114,7 @@ export async function getEmbedding(text: string): Promise<number[] | null> {
       pooling: "mean",
       normalize: true,
     });
-    return Array.from(result.data as Float32Array);
+    return Array.from(result.data);
   } catch {
     return null;
   }
@@ -126,7 +142,7 @@ export interface SemanticOptions {
 export function findSimilarCards(
   newFront: string,
   existingCards: CardForSimilarity[],
-  jaccardThreshold: number = 0.65,
+  jaccardThreshold: number,
   semantic?: SemanticOptions
 ): SimilarCard[] {
   const resultMap = new Map<string, SimilarCard>();
@@ -169,25 +185,21 @@ export function findSimilarCards(
 
 // --- Duplicate check (combines both stages) ---
 
-export function checkDuplicate(
-  newFront: string,
-  existingCards: CardForSimilarity[],
-  duplicateThreshold: number = 0.85,
-  warningThreshold: number = 0.65,
-  semantic?: SemanticOptions
-): {
+export interface DuplicateCheckResult {
   isDuplicate: boolean;
   reason?: string;
   similarCards: SimilarCard[];
-} {
-  const similar = findSimilarCards(
-    newFront,
-    existingCards,
-    warningThreshold,
-    semantic
-  );
+}
 
-  const duplicates = similar.filter((c) => c.similarity >= duplicateThreshold);
+/** Warns at JACCARD_WARN (or a semantic match); a duplicate at JACCARD_DUPLICATE. */
+export function checkDuplicate(
+  newFront: string,
+  existingCards: CardForSimilarity[],
+  semantic?: SemanticOptions
+): DuplicateCheckResult {
+  const similar = findSimilarCards(newFront, existingCards, JACCARD_WARN, semantic);
+
+  const duplicates = similar.filter((c) => c.similarity >= JACCARD_DUPLICATE);
   if (duplicates.length > 0) {
     return {
       isDuplicate: true,

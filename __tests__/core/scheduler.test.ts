@@ -4,6 +4,7 @@ import {
   getRetrievability,
   createNewFsrsCard,
   cardMaturity,
+  isGrade,
 } from "../../src/core/scheduler.js";
 import { Rating, State } from "ts-fsrs";
 
@@ -41,7 +42,7 @@ describe("scheduler", () => {
       expect(result.card.due.getTime()).toBeGreaterThan(Date.now());
       expect(result.card.lastReview).toBeInstanceOf(Date);
 
-      expect(result.log.rating).toBe(Rating.Good);
+      expect(result.elapsedDays).toBe(0);
     });
 
     it("reviews a card as Again and increments lapses if it was in Review state", () => {
@@ -104,6 +105,25 @@ describe("scheduler", () => {
       reviewCard(prismaCard, Rating.Good);
       expect(prismaCard.reps).toBe(origReps);
     });
+
+    it("schedules sooner at a higher request retention", () => {
+      const now = new Date("2026-06-10T12:00:00.000Z");
+      const card = {
+        due: now,
+        stability: 10,
+        difficulty: 5,
+        reps: 5,
+        lapses: 0,
+        state: State.Review as number,
+        lastReview: new Date("2026-05-31T12:00:00.000Z"),
+        interval: 10,
+      };
+
+      const strict = reviewCard(card, Rating.Good, now, 0.95);
+      const lax = reviewCard(card, Rating.Good, now, 0.8);
+      expect(strict.card.interval).toBeLessThan(lax.card.interval);
+      expect(strict.elapsedDays).toBe(10);
+    });
   });
 
   describe("getRetrievability", () => {
@@ -157,6 +177,13 @@ describe("scheduler", () => {
 
       const r = getRetrievability(prismaCard);
       expect(r).toBe(0);
+    });
+  });
+
+  describe("isGrade", () => {
+    it("accepts the four ratings and nothing else", () => {
+      expect([1, 2, 3, 4].every(isGrade)).toBe(true);
+      for (const x of [0, 5, 2.5, "3", null, undefined]) expect(isGrade(x)).toBe(false);
     });
   });
 });

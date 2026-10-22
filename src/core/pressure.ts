@@ -1,7 +1,9 @@
+import type { Prisma } from "@prisma/client";
 import { getDb } from "../db/client.js";
-import { listDecks, getDeckStats } from "./deck-service.js";
+import { listDeckStats } from "./deck-service.js";
 import type { DeckStats } from "./types.js";
 import { State } from "ts-fsrs";
+import { startOfLocalDay } from "./days.js";
 
 export const WARN_FLASHCARDS = 20;
 export const PAUSE_FLASHCARDS = 50;
@@ -35,22 +37,32 @@ export interface PressureReport {
 }
 
 /**
- * Scheduled review backlog. New cards are excluded on purpose: they are an
- * optional pool you draw from, not a scheduled debt, so they must never drive
- * review pressure — otherwise a pile of fresh material would block its own
- * studying. New-card intake is policed by the cards-added-today axis instead.
+ * Scheduled review backlog: cards due by `now`, not suspended, not New. New
+ * cards are excluded on purpose: they are an optional pool you draw from, not a
+ * scheduled debt, so they must never drive review pressure — otherwise a pile
+ * of fresh material would block its own studying. New-card intake is policed by
+ * the cards-added-today axis instead. Sessions and the overview queue from the
+ * same predicate, so "due" means one thing everywhere.
  */
-async function reviewBacklogCount(): Promise<number> {
-  const db = getDb();
-  return db.card.count({
-    where: { due: { lte: new Date() }, suspended: false, state: { not: State.New } },
-  });
+export function dueReviewWhere(now: Date = new Date()): Prisma.CardWhereInput {
+  return { due: { lte: now }, suspended: false, state: { not: State.New } };
 }
 
 /**
- * Cards created since the start of the local day — "today" means the
- * developer's own calendar day in the process timezone, intentionally
- * diverging from analytics-service.ts's UTC-ISO streak convention.
+ * The new-card pool: every New card that is not suspended. Its `due` is
+ * ignored: a New card has no schedule yet (its `due` is just its creation
+ * time), and a session draws from the whole pool, so the pool reported here is
+ * the one a session would take from.
+ */
+export const NEW_CARD_WHERE: Prisma.CardWhereInput = { state: State.New, suspended: false };
+
+async function reviewBacklogCount(): Promise<number> {
+  return getDb().card.count({ where: dueReviewWhere() });
+}
+
+/**
+ * Cards created since the start of the local day (days.ts), the developer's
+ * own calendar day in the process timezone, like every day count here.
  *
  * Splits are excluded via the explicit `inheritedFrom` column: they reshape
  * material already in the deck, so counting them would push a developer toward
@@ -58,20 +70,14 @@ async function reviewBacklogCount(): Promise<number> {
  * still counted, so suspending is never a way to dodge the intake gate.
  */
 async function cardsAddedTodayCount(): Promise<number> {
-  const db = getDb();
-  const startOfToday = new Date();
-  startOfToday.setHours(0, 0, 0, 0);
-  return db.card.count({
-    where: { createdAt: { gte: startOfToday }, inheritedFrom: null },
+  return getDb().card.count({
+    where: { createdAt: { gte: startOfLocalDay(new Date()) }, inheritedFrom: null },
   });
 }
 
-/** Due new cards — reported for visibility only, never counted as pressure. */
+/** The new-card pool — reported for visibility only, never counted as pressure. */
 async function newAvailableCount(): Promise<number> {
-  const db = getDb();
-  return db.card.count({
-    where: { due: { lte: new Date() }, suspended: false, state: State.New },
-  });
+  return getDb().card.count({ where: NEW_CARD_WHERE });
 }
 
 function axisVerdict(count: number, warn: number, pause: number): PressureVerdict {
@@ -121,9 +127,9 @@ interface PressureCore {
 }
 
 /**
- * Counts-only pressure: two queries, no per-deck fan-out. The create gate runs
- * on every fresh card and reads nothing but the verdict and its numbers, so it
- * must not pay for the reporting wrapper's 5-queries-per-deck breakdown.
+ * Counts-only pressure: two queries, no per-deck breakdown. The create gate
+ * runs on every fresh card and reads nothing but the verdict and its numbers,
+ * so it must not pay for the reporting wrapper's deck stats.
  */
 async function checkPressureCore(): Promise<PressureCore> {
   const [flashcardsDue, newToday] = await Promise.all([
@@ -178,12 +184,11 @@ async function checkPressureCore(): Promise<PressureCore> {
 
 /** Full report: the counts plus the per-deck breakdown the /study skill reads. */
 export async function checkPressure(): Promise<PressureReport> {
-  const [core, newAvailable, deckList] = await Promise.all([
+  const [core, newAvailable, decks] = await Promise.all([
     checkPressureCore(),
     newAvailableCount(),
-    listDecks(),
+    listDeckStats(),
   ]);
-  const decks = await Promise.all(deckList.map((d) => getDeckStats(d.id)));
 
   return {
     verdict: core.verdict,
@@ -201,8 +206,8 @@ export async function checkPressure(): Promise<PressureReport> {
  * Throws when pressure is at pause; the message is the UX, mirroring assertCardContent.
  *
  * Must call the core, never `checkPressure()`: this runs on every card creation,
- * and the full report's per-deck fan-out costs 4 + 5N queries to build a `decks`
- * field the gate discards.
+ * and the full report spends four more queries (the new-card pool and the
+ * per-deck stats) on fields the gate discards.
  */
 export async function assertCanCreateCard(): Promise<void> {
   const core = await checkPressureCore();

@@ -1,29 +1,41 @@
 import { getDb } from "../db/client.js";
 import { cardMaturity, getRetrievability, toSchedulableCard } from "./scheduler.js";
 import { State } from "ts-fsrs";
-import { localDay } from "./days.js";
+import { localDay, startOfLocalDay } from "./days.js";
 
-export async function getStudyStreak(): Promise<number> {
-  const db = getDb();
-  const sessions = await db.studySession.findMany({
-    where: { cardsReviewed: { gt: 0 } },
-    orderBy: { startTime: "desc" },
-    select: { startTime: true },
-  });
-
-  if (sessions.length === 0) return 0;
-
-  // Local study days (core/days.ts), like every other day count here.
-  const days = new Set(sessions.map((s) => localDay(s.startTime)));
-
-  let streak = 0;
-  const checkDate = new Date();
-  while (days.has(localDay(checkDate))) {
-    streak++;
-    checkDate.setDate(checkDate.getDate() - 1);
+/**
+ * Consecutive local days (days.ts), ending today, with at least one review.
+ * Counted from the reviews themselves rather than sessions, so a session that
+ * runs past midnight credits both days, as the overview's week does. Reads the
+ * last month of reviews, and a window twice as long only while the streak
+ * fills the window it has.
+ */
+export async function getStudyStreak(now: Date = new Date()): Promise<number> {
+  for (let span = 32; ; span *= 2) {
+    const reviews = await getDb().review.findMany({
+      where: { reviewedAt: { gte: startOfLocalDay(now, span - 1) } },
+      select: { reviewedAt: true },
+    });
+    const days = new Set(reviews.map((r) => localDay(r.reviewedAt)));
+    let streak = 0;
+    while (streak < span && days.has(localDay(startOfLocalDay(now, streak)))) streak++;
+    if (streak < span) return streak;
   }
+}
 
-  return streak;
+/**
+ * Card ids from the newest `limit` reviews, deduplicated, newest first, with
+ * the local day each was last reviewed.
+ */
+export async function recentlyStudied(limit = 100): Promise<{ id: string; at: string }[]> {
+  const newest = await getDb().review.findMany({
+    select: { cardId: true, reviewedAt: true },
+    orderBy: { reviewedAt: "desc" },
+    take: limit,
+  });
+  const latest = new Map<string, Date>();
+  for (const r of newest) if (!latest.has(r.cardId)) latest.set(r.cardId, r.reviewedAt);
+  return [...latest].map(([id, at]) => ({ id, at: localDay(at) }));
 }
 
 export async function getRetentionByDeck(): Promise<

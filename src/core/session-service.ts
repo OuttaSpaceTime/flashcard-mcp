@@ -1,24 +1,25 @@
 import { getDb } from "../db/client.js";
-import { assertNoUnresolvedLeech, flagLeechOnServe } from "./leeches.js";
+import { findUnresolvedLeeches, flagLeechOnServe, leechBlockError } from "./leeches.js";
 import {
-  reviewCard as scheduleReview,
+  reviewCard,
   getRetrievability,
   toSchedulableCard,
+  type ReviewResult,
+  type SchedulableCard,
 } from "./scheduler.js";
-import {
-  type MasterConfig,
-  type SessionQueueItem,
-  type SessionAdjustment,
-  DEFAULT_CONFIG,
-  Rating,
-  State,
-} from "./types.js";
-import type { Grade } from "ts-fsrs";
-import type { Card as PrismaCard } from "@prisma/client";
+import { dueReviewWhere, NEW_CARD_WHERE } from "./pressure.js";
+import { MS_PER_DAY } from "./days.js";
+import type { MasterConfig, SessionQueueItem, SessionAdjustment } from "./types.js";
+import { Rating, State, type Grade } from "ts-fsrs";
+import type { Card as PrismaCard, Config, Prisma, StudySession } from "@prisma/client";
 
 interface SessionState {
   queue: SessionQueueItem[];
+  /** Index of the card being served: advanced by a review, a skip or a deleted card. */
   pointer: number;
+  /** Reviews submitted, the denominator of `accuracy` (skips are not reviews). */
+  reviewed: number;
+  /** Reviews rated Good or Easy. */
   goodCount: number;
   /**
    * Queue slots passed over because their card was deleted before it was
@@ -28,6 +29,16 @@ interface SessionState {
   dropped: number;
   /** Category filter the session was started with, for new-card top-ups. */
   category?: string;
+  /** Deck filter (id) the session was started with, for new-card top-ups. */
+  deckId?: string;
+}
+
+/** The cards a session draws from, given the filters it was started with. */
+function scopeWhere(filters: { category?: string; deckId?: string }): Prisma.CardWhereInput {
+  return {
+    ...(filters.category !== undefined ? { category: filters.category } : {}),
+    ...(filters.deckId !== undefined ? { deckId: filters.deckId } : {}),
+  };
 }
 
 /**
@@ -45,10 +56,12 @@ async function loadState(sessionId: string): Promise<SessionState | undefined> {
   if (cached) return cached;
   const row = await getDb().studySession.findUnique({
     where: { id: sessionId },
-    select: { queueState: true, endTime: true },
+    select: { queueState: true, endTime: true, cardsReviewed: true },
   });
   if (row?.queueState == null || row.endTime != null) return undefined;
-  const state = JSON.parse(row.queueState) as SessionState;
+  const saved = JSON.parse(row.queueState) as Omit<SessionState, "reviewed"> & { reviewed?: number };
+  // A state saved before `reviewed` existed: the row counts the same reviews.
+  const state: SessionState = { ...saved, reviewed: saved.reviewed ?? row.cardsReviewed };
   sessions.set(sessionId, state);
   return state;
 }
@@ -67,45 +80,44 @@ async function dropState(sessionId: string): Promise<void> {
   await getDb().studySession.updateMany({ where: { id: sessionId }, data: { queueState: null } });
 }
 
-interface StartSessionResult {
+/** The saved settings, created with the schema's defaults the first time. */
+async function readConfig(): Promise<Config> {
+  const db = getDb();
+  const saved = await db.config.findUnique({ where: { id: "default" } });
+  return saved ?? db.config.upsert({ where: { id: "default" }, create: { id: "default" }, update: {} });
+}
+
+export interface StartSessionResult {
   id: string;
   queue: SessionQueueItem[];
+  /** New cards queued (`new_card` and `unguided_priority` items). */
+  newCount: number;
+  /** Due review cards queued (`due_review` items). */
+  reviewCount: number;
 }
 
 export async function startSession(
-  configOverrides?: Partial<MasterConfig> & { category?: string }
+  configOverrides?: Partial<MasterConfig> & { category?: string; deckId?: string }
 ): Promise<StartSessionResult> {
   const db = getDb();
   await discardEmptySessions();
 
-  const { category, ...configOnly } = configOverrides ?? {};
-  const categoryFilter = category != null && category !== "" ? category : undefined;
+  const { category, deckId, ...overrides } = configOverrides ?? {};
+  const filters = {
+    category: category != null && category !== "" ? category : undefined,
+    deckId: deckId != null && deckId !== "" ? deckId : undefined,
+  };
+  const scope = scopeWhere(filters);
 
-  const savedConfig = await db.config.findUnique({ where: { id: "default" } });
-  const filteredOverrides = Object.fromEntries(
-    Object.entries(configOnly as Record<string, unknown>).filter(([, v]) => v !== undefined)
-  ) as Partial<MasterConfig>;
+  const saved = await readConfig();
   const config: MasterConfig = {
-    ...DEFAULT_CONFIG,
-    ...(savedConfig
-      ? {
-          maxNewCardsPerSession: savedConfig.maxNewCardsPerSession,
-          maxReviewCardsPerSession: savedConfig.maxReviewCardsPerSession,
-          practiceFirstMode: savedConfig.practiceFirstMode,
-        }
-      : {}),
-    ...filteredOverrides,
+    maxNewCardsPerSession: overrides.maxNewCardsPerSession ?? saved.maxNewCardsPerSession,
+    maxReviewCardsPerSession: overrides.maxReviewCardsPerSession ?? saved.maxReviewCardsPerSession,
+    practiceFirstMode: overrides.practiceFirstMode ?? saved.practiceFirstMode,
   };
 
-  const now = new Date();
-
   const dueReviewCards = await db.card.findMany({
-    where: {
-      due: { lte: now },
-      suspended: false,
-      state: { not: State.New },
-      ...(categoryFilter !== undefined ? { category: categoryFilter } : {}),
-    },
+    where: { ...dueReviewWhere(), ...scope },
     orderBy: { due: "asc" },
   });
 
@@ -116,9 +128,8 @@ export async function startSession(
     }))
     .sort((a, b) => a.retrievability - b.retrievability);
 
-  const maxReviews = config.maxReviewCardsPerSession;
   const reviewQueue: SessionQueueItem[] = rankedReviews
-    .slice(0, maxReviews)
+    .slice(0, config.maxReviewCardsPerSession)
     .map((r) => ({ cardId: r.card.id, reason: "due_review" as const }));
 
   // Reduce new card allowance when review-heavy
@@ -128,11 +139,7 @@ export async function startSession(
   }
 
   const newCards = await db.card.findMany({
-    where: {
-      state: State.New,
-      suspended: false,
-      ...(categoryFilter !== undefined ? { category: categoryFilter } : {}),
-    },
+    where: { ...NEW_CARD_WHERE, ...scope },
     orderBy: { createdAt: "asc" },
     take: maxNew,
   });
@@ -148,20 +155,36 @@ export async function startSession(
   }
 
   const queue = [...unguidedQueue, ...reviewQueue, ...guidedNewQueue];
-  const state: SessionState = { queue, pointer: 0, goodCount: 0, dropped: 0, category: categoryFilter };
+  const state: SessionState = {
+    queue,
+    pointer: 0,
+    reviewed: 0,
+    goodCount: 0,
+    dropped: 0,
+    ...filters,
+  };
   const session = await db.studySession.create({ data: { queueState: JSON.stringify(state) } });
   sessions.set(session.id, state);
 
-  return { id: session.id, queue };
+  return { id: session.id, queue, newCount: newCards.length, reviewCount: reviewQueue.length };
 }
 
-export async function getNextCard(
-  sessionId: string
-): Promise<PrismaCard | null> {
+/**
+ * The next card, a leech block, or null when the session is over (or unknown).
+ * `blocked` holds every card whose leech flag is unanswered, oldest flag first.
+ */
+export type NextCard = { card: PrismaCard } | { blocked: PrismaCard[] } | null;
+
+/**
+ * `getNextCard` with the leech block returned as data rather than thrown: a GUI
+ * needs the blocking card itself, to show it with the ways out.
+ */
+export async function getNextCardOrBlock(sessionId: string): Promise<NextCard> {
   // A leech flagged on the previous serve blocks the whole loop, not just this
   // session: the card has to be rewritten, split, dropped, or explicitly kept
   // before any more studying happens.
-  await assertNoUnresolvedLeech();
+  const unresolved = await findUnresolvedLeeches();
+  if (unresolved.length > 0) return { blocked: unresolved };
 
   const state = await loadState(sessionId);
   if (!state) return null;
@@ -179,7 +202,7 @@ export async function getNextCard(
     const card = await db.card.findUnique({ where: { id: item.cardId } });
     if (card) {
       if (skippedDeleted) await saveState(sessionId, state);
-      return flagLeechOnServe(card);
+      return { card: await flagLeechOnServe(card) };
     }
     state.pointer += 1;
     state.dropped += 1;
@@ -189,6 +212,14 @@ export async function getNextCard(
 
   await dropState(sessionId);
   return null;
+}
+
+/** The next card, or null when the session is over; throws on a leech block. */
+export async function getNextCard(sessionId: string): Promise<PrismaCard | null> {
+  const next = await getNextCardOrBlock(sessionId);
+  if (next == null) return null;
+  if ("blocked" in next) throw leechBlockError(next.blocked);
+  return next.card;
 }
 
 export interface QueuePosition {
@@ -220,17 +251,14 @@ export async function getQueuePosition(sessionId: string): Promise<QueuePosition
 /**
  * Append one fresh new card to a session's queue, replacing a card that was
  * deleted mid-session. Picks the oldest unqueued New card, respecting the
- * session's category filter; does nothing when none is available.
+ * session's category and deck filters; does nothing when none is available.
  */
 async function topUpNewCard(state: SessionState): Promise<void> {
-  const db = getDb();
-  const queuedIds = state.queue.map((item) => item.cardId);
-  const replacement = await db.card.findFirst({
+  const replacement = await getDb().card.findFirst({
     where: {
-      state: State.New,
-      suspended: false,
-      id: { notIn: queuedIds },
-      ...(state.category !== undefined ? { category: state.category } : {}),
+      ...NEW_CARD_WHERE,
+      id: { notIn: state.queue.map((item) => item.cardId) },
+      ...scopeWhere(state),
     },
     orderBy: { createdAt: "asc" },
   });
@@ -250,108 +278,131 @@ export type ReviewSchedule = {
   intraDay: boolean;
 };
 
-const DAY_MS = 24 * 60 * 60 * 1000;
-
-function toReviewSchedule(result: ReturnType<typeof scheduleReview>, now: Date): ReviewSchedule {
+function toReviewSchedule(result: ReviewResult, now: Date): ReviewSchedule {
   return {
     due: result.card.due.toISOString(),
     interval: result.card.interval,
     state: result.card.state,
     // A card resurfacing in under a day is an intra-day learning step.
-    intraDay: result.card.due.getTime() - now.getTime() < DAY_MS,
+    intraDay: result.card.due.getTime() - now.getTime() < MS_PER_DAY,
   };
 }
 
 /**
  * What each rating would schedule for a card, without writing anything: the
- * app shows it on the rating keys. It runs the same FSRS step and the same
- * intra-day rule as `submitReview`, so a rating lands where its key said, up
- * to the minutes that pass between the preview and the review.
+ * app shows it on the rating keys. It runs the same FSRS step (at the saved
+ * request retention) and the same intra-day rule as `submitReview`, so a
+ * rating lands where its key said, up to the minutes that pass between the
+ * preview and the review.
  */
-export function previewSchedules(
-  card: Parameters<typeof toSchedulableCard>[0],
+export async function previewSchedules(
+  card: SchedulableCard,
   now: Date = new Date()
-): Record<Grade, ReviewSchedule> {
+): Promise<Record<Grade, ReviewSchedule>> {
+  const { requestRetention } = await readConfig();
   const schedulable = toSchedulableCard(card);
-  const at = (rating: Grade) => toReviewSchedule(scheduleReview(schedulable, rating, now), now);
+  const at = (rating: Grade) => toReviewSchedule(reviewCard(schedulable, rating, now, requestRetention), now);
   return { 1: at(1), 2: at(2), 3: at(3), 4: at(4) };
 }
 
+/**
+ * Record a rating: reschedule the card, log the review, advance the session.
+ * Refused unless the session is open (an ended, exhausted or unknown session
+ * has no queue to advance and no accuracy to keep). The three writes are one
+ * transaction, so a failure leaves none of them behind.
+ */
 export async function submitReview(
   sessionId: string,
   cardId: string,
   rating: Grade,
   responseMs?: number
 ): Promise<ReviewSchedule> {
-  const db = getDb();
+  const state = await loadState(sessionId);
+  if (state === undefined) {
+    throw new Error(`Session ${sessionId} is not open: it was ended, ran out of cards, or does not exist`);
+  }
 
+  const db = getDb();
   const card = await db.card.findUnique({ where: { id: cardId } });
   if (!card) throw new Error(`Card not found: ${cardId}`);
 
-  // Schedule via FSRS
+  const { requestRetention } = await readConfig();
   const now = new Date();
-  const schedulable = toSchedulableCard(card);
-  const result = scheduleReview(schedulable, rating, now);
+  const result = reviewCard(toSchedulableCard(card), rating, now, requestRetention);
   const schedule = toReviewSchedule(result, now);
-  const intraDay = schedule.intraDay;
 
-  // Update card with new scheduling. updatedAt stays: it means the card's
-  // content changed (the app's stamp, handlers.ts), and a review is not that.
-  await db.card.update({
-    where: { id: cardId },
-    data: {
-      updatedAt: card.updatedAt,
-      due: result.card.due,
-      stability: result.card.stability,
-      difficulty: result.card.difficulty,
-      reps: result.card.reps,
-      lapses: result.card.lapses,
-      state: result.card.state,
-      lastReview: result.card.lastReview,
-      interval: result.card.interval,
-    },
-  });
-
-  // Create review record
-  await db.review.create({
-    data: {
-      cardId,
-      rating,
-      responseMs: responseMs ?? null,
-      stability: result.card.stability,
-      difficulty: result.card.difficulty,
-      elapsedDays: result.log.elapsedDays,
-    },
-  });
-
-  // Update session stats
-  const state = await loadState(sessionId);
-  const isNewCard = card.state === State.New;
   const isGood = rating === Rating.Good || rating === Rating.Easy;
-  if (state) {
-    state.goodCount += isGood ? 1 : 0;
-    state.pointer += 1;
+  const next: SessionState = {
+    ...state,
+    pointer: state.pointer + 1,
+    reviewed: state.reviewed + 1,
+    goodCount: state.goodCount + (isGood ? 1 : 0),
+    // An intra-day learning step repeats the card later this session.
+    queue: schedule.intraDay ? [...state.queue, { cardId, reason: "learning_repeat" }] : state.queue,
+  };
 
-    // Re-queue intra-day learning steps so the card repeats this session
-    if (intraDay) {
-      state.queue.push({ cardId, reason: "learning_repeat" });
-    }
-  }
-  const reviewed = state?.pointer ?? 1;
-  const goodCount = state?.goodCount ?? (isGood ? 1 : 0);
-  const accuracy = goodCount / reviewed;
-
-  await db.studySession.update({
-    where: { id: sessionId },
-    data: {
-      cardsReviewed: { increment: 1 },
-      accuracy,
-      ...(isNewCard ? { newCards: { increment: 1 } } : {}),
-      ...(state ? { queueState: JSON.stringify(state) } : {}),
-    },
-  });
+  await db.$transaction([
+    // updatedAt stays: it means the card's content changed (the app's stamp,
+    // handlers.ts), and a review is not that.
+    db.card.update({
+      where: { id: cardId },
+      data: {
+        updatedAt: card.updatedAt,
+        due: result.card.due,
+        stability: result.card.stability,
+        difficulty: result.card.difficulty,
+        reps: result.card.reps,
+        lapses: result.card.lapses,
+        state: result.card.state,
+        lastReview: result.card.lastReview,
+        interval: result.card.interval,
+      },
+    }),
+    db.review.create({
+      data: {
+        cardId,
+        rating,
+        responseMs: responseMs ?? null,
+        stability: result.card.stability,
+        difficulty: result.card.difficulty,
+        elapsedDays: result.elapsedDays,
+      },
+    }),
+    db.studySession.update({
+      where: { id: sessionId },
+      data: {
+        cardsReviewed: { increment: 1 },
+        accuracy: next.goodCount / next.reviewed,
+        ...(card.state === State.New ? { newCards: { increment: 1 } } : {}),
+        queueState: JSON.stringify(next),
+      },
+    }),
+  ]);
+  sessions.set(sessionId, next);
 
   return schedule;
+}
+
+/** A session as `endSession` reports it, dates as ISO strings. */
+export interface SessionSummary {
+  id: string;
+  startTime: string;
+  endTime: string;
+  cardsReviewed: number;
+  newCards: number;
+  /** Share of the session's reviews rated Good or Easy. */
+  accuracy: number;
+}
+
+function toSessionSummary(session: StudySession & { endTime: Date }): SessionSummary {
+  return {
+    id: session.id,
+    startTime: session.startTime.toISOString(),
+    endTime: session.endTime.toISOString(),
+    cardsReviewed: session.cardsReviewed,
+    newCards: session.newCards,
+    accuracy: session.accuracy,
+  };
 }
 
 /**
@@ -359,20 +410,23 @@ export async function submitReview(
  * reviews no longer touch it, so a row with a null `endTime` is genuinely still
  * open rather than merely idle.
  *
- * Idempotent: an already-closed session keeps its original `endTime`.
+ * Idempotent: an already-closed session keeps its original `endTime`. Returns
+ * null for an unknown session.
  */
-export async function endSession(sessionId: string) {
+export async function endSession(sessionId: string): Promise<SessionSummary | null> {
   const db = getDb();
   const session = await db.studySession.findUnique({ where: { id: sessionId } });
   if (session == null) return null;
 
   sessions.delete(sessionId);
-  if (session.endTime != null) return session;
+  if (session.endTime != null) return toSessionSummary({ ...session, endTime: session.endTime });
 
-  return db.studySession.update({
+  const endTime = new Date();
+  const ended = await db.studySession.update({
     where: { id: sessionId },
-    data: { endTime: new Date(), queueState: null },
+    data: { endTime, queueState: null },
   });
+  return toSessionSummary({ ...ended, endTime });
 }
 
 /**
@@ -386,8 +440,7 @@ export async function endSession(sessionId: string) {
  * that it was never closed.
  */
 async function discardEmptySessions(): Promise<void> {
-  const db = getDb();
-  await db.studySession.deleteMany({ where: { endTime: null, cardsReviewed: 0 } });
+  await getDb().studySession.deleteMany({ where: { endTime: null, cardsReviewed: 0 } });
 }
 
 export async function skipCard(sessionId: string): Promise<boolean> {
@@ -412,7 +465,7 @@ export async function adjustSession(
     remaining = remaining.slice(0, adjustment.maxCards);
   }
 
-  const cardFilter: Record<string, unknown> = {};
+  const cardFilter: Prisma.CardWhereInput = {};
   if (adjustment.focusDeck != null && adjustment.focusDeck !== "") {
     cardFilter.deckId = adjustment.focusDeck;
   }
@@ -421,8 +474,7 @@ export async function adjustSession(
   }
 
   if (Object.keys(cardFilter).length > 0 && remaining.length > 0) {
-    const db = getDb();
-    const matches = await db.card.findMany({
+    const matches = await getDb().card.findMany({
       where: { ...cardFilter, id: { in: remaining.map((item) => item.cardId) } },
       select: { id: true },
     });
@@ -437,4 +489,3 @@ export async function adjustSession(
 
   return { queue: remaining };
 }
-

@@ -10,7 +10,7 @@ import {
   skipCard,
   endSession,
 } from "../../src/core/session-service.js";
-import { createCard, deleteCard } from "../../src/core/card-service.js";
+import { deleteCard } from "../../src/core/card-service.js";
 import { createDeck } from "../../src/core/deck-service.js";
 import { getDb } from "../../src/db/client.js";
 import { Rating, State } from "ts-fsrs";
@@ -60,6 +60,20 @@ describe("session-service", () => {
       const session = await startSession();
       expect(session.id).toBeDefined();
       expect(session.queue.length).toBe(3);
+    });
+
+    it("counts the new and review cards it queued", async () => {
+      await seedCards(2);
+      await seedCards(3, {
+        state: State.Review,
+        due: new Date(Date.now() - 24 * 60 * 60 * 1000),
+        stability: 5,
+        lastReview: new Date(Date.now() - 6 * 24 * 60 * 60 * 1000),
+      });
+
+      const session = await startSession();
+      expect(session.newCount).toBe(2);
+      expect(session.reviewCount).toBe(3);
     });
 
     it("uses defaults when configOverrides contains undefined values", async () => {
@@ -127,10 +141,6 @@ describe("session-service", () => {
 
       const session = await startSession({ practiceFirstMode: true });
 
-      // First cards in queue should be unguided
-      const firstUnguided = session.queue.findIndex(
-        (item) => item.reason === "unguided_priority"
-      );
       // Unguided cards should appear (might be at start)
       const unguidedCount = session.queue.filter(
         (item) => item.reason === "unguided_priority"
@@ -323,13 +333,78 @@ describe("session-service", () => {
       const session = await startSession({ maxNewCardsPerSession: 4 });
       const db = getDb();
 
-      for (const rating of [Rating.Easy, Rating.Hard, Rating.Good, Rating.Again]) {
+      for (const rating of [Rating.Easy, Rating.Hard, Rating.Good, Rating.Again] as const) {
         const card = await getNextCard(session.id);
         await submitReview(session.id, card!.id, rating);
       }
 
       const updated = await db.studySession.findUnique({ where: { id: session.id } });
       expect(updated!.accuracy).toBe(0.5); // Easy + Good = 2 correct / 4 total
+    });
+
+    // Regression: accuracy divided by the queue pointer, which skips and
+    // deleted cards also advance, so a skip halved a perfect session.
+    it("leaves skipped cards out of accuracy", async () => {
+      await seedCards(2);
+      const session = await startSession();
+
+      await getNextCard(session.id);
+      await skipCard(session.id);
+      const card = await getNextCard(session.id);
+      await submitReview(session.id, card!.id, Rating.Good);
+
+      const row = await getDb().studySession.findUnique({ where: { id: session.id } });
+      expect(row!.accuracy).toBe(1.0);
+    });
+
+    // Regression: a review on an ended session overwrote its accuracy with
+    // that one review's 0 or 1, after writing the card and the review.
+    it("refuses a review on an ended session and writes nothing", async () => {
+      await seedCards(2);
+      const session = await startSession();
+      const card = await getNextCard(session.id);
+      await submitReview(session.id, card!.id, Rating.Good);
+      await endSession(session.id);
+      const db = getDb();
+      const before = await db.card.findUnique({ where: { id: card!.id } });
+
+      await expect(submitReview(session.id, card!.id, Rating.Again)).rejects.toThrow(/not open/);
+
+      const row = await db.studySession.findUnique({ where: { id: session.id } });
+      expect(row!.accuracy).toBe(1.0);
+      expect(row!.cardsReviewed).toBe(1);
+      expect(await db.review.count()).toBe(1);
+      expect(await db.card.findUnique({ where: { id: card!.id } })).toEqual(before);
+    });
+
+    it("refuses a review on an unknown session", async () => {
+      const [card] = await seedCards(1);
+      await expect(submitReview("no-such-session", card.id, Rating.Good)).rejects.toThrow(/not open/);
+      expect(await getDb().review.count()).toBe(0);
+    });
+
+    it("schedules at the saved request retention", async () => {
+      const reviewCardAt = async (requestRetention: number) => {
+        await getDb().config.upsert({
+          where: { id: "default" },
+          create: { id: "default", requestRetention },
+          update: { requestRetention },
+        });
+        const [card] = await seedCards(1, {
+          state: State.Review,
+          due: new Date(Date.now() - 24 * 60 * 60 * 1000),
+          stability: 10,
+          lastReview: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000),
+        });
+        const session = await startSession();
+        await getNextCard(session.id);
+        return (await submitReview(session.id, card.id, Rating.Good)).interval;
+      };
+
+      const strict = await reviewCardAt(0.95);
+      await getDb().card.deleteMany();
+      const lax = await reviewCardAt(0.8);
+      expect(strict).toBeLessThan(lax);
     });
   });
 
@@ -639,7 +714,7 @@ describe("session-service", () => {
         const session = await startSession();
         const first = await endSession(session.id);
         const second = await endSession(session.id);
-        expect(second!.endTime!.getTime()).toBe(first!.endTime!.getTime());
+        expect(second!.endTime).toBe(first!.endTime);
       });
 
       it("stops the queue so no further card is served", async () => {
@@ -685,7 +760,7 @@ describe("session-service", () => {
         await startSession();
 
         const row = await getDb().studySession.findUnique({ where: { id: done.id } });
-        expect(row!.endTime!.getTime()).toBe(ended!.endTime!.getTime());
+        expect(row!.endTime!.toISOString()).toBe(ended!.endTime);
       });
     });
   });

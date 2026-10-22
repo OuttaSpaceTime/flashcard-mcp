@@ -1,12 +1,11 @@
 import { getDb } from "../db/client.js";
-import { checkPressure, type PressureReport } from "../core/pressure.js";
-import { checkCalibration, type CalibrationReport } from "../core/calibration.js";
-import { getStudyStreak } from "../core/analytics-service.js";
-import { cardMaturity } from "../core/scheduler.js";
-import type { CardMaturity } from "../core/types.js";
-import { State } from "../core/types.js";
-import { visibleText } from "../core/content-rules.js";
-import { localDay } from "../core/days.js";
+import { checkPressure, dueReviewWhere, type PressureReport } from "./pressure.js";
+import { checkCalibration, type CalibrationReport } from "./calibration.js";
+import { getStudyStreak } from "./analytics-service.js";
+import { cardMaturity } from "./scheduler.js";
+import type { CardMaturity } from "./types.js";
+import { visibleText } from "./content-rules.js";
+import { localDay, startOfLocalDay } from "./days.js";
 
 /**
  * A rough picture of where studying stands: what is pending, how retention is
@@ -39,6 +38,7 @@ export interface Overview {
   pressure: PressureReport;
   calibration: CalibrationReport;
   streak: number;
+  /** Unsuspended cards; the maturity buckets sum to it. */
   totalCards: number;
   maturity: Record<CardMaturity, number>;
   /** Oldest first, ending today: always `days` entries. */
@@ -59,8 +59,7 @@ export function bucketWeek(
   const out: DayCount[] = [];
   const index = new Map<string, DayCount>();
   for (let i = days - 1; i >= 0; i--) {
-    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i);
-    const entry = { day: localDay(d), reviews: 0, again: 0 };
+    const entry = { day: localDay(startOfLocalDay(now, i)), reviews: 0, again: 0 };
     out.push(entry);
     index.set(entry.day, entry);
   }
@@ -80,24 +79,24 @@ export async function getOverview(opts: { pendingLimit?: number; now?: Date } = 
   const [pressure, calibration, streak, cards, reviews, pending] = await Promise.all([
     checkPressure(),
     checkCalibration(),
-    getStudyStreak(),
-    db.card.findMany({ select: { state: true, interval: true, suspended: true } }),
+    getStudyStreak(now),
+    db.card.findMany({ where: { suspended: false }, select: { state: true, interval: true } }),
     db.review.findMany({
-      where: { reviewedAt: { gte: new Date(now.getFullYear(), now.getMonth(), now.getDate() - 6) } },
+      where: { reviewedAt: { gte: startOfLocalDay(now, 6) } },
       select: { reviewedAt: true, rating: true },
     }),
     db.card.findMany({
-      where: { due: { lte: now }, suspended: false, state: { not: State.New } },
+      where: dueReviewWhere(now),
       include: { deck: { select: { name: true } } },
       orderBy: { due: "asc" },
       take: opts.pendingLimit ?? 8,
     }),
   ]);
 
+  // Suspended cards are out of rotation: neither in the buckets nor the total,
+  // so the buckets always sum to totalCards.
   const maturity: Record<CardMaturity, number> = { new: 0, learning: 0, familiar: 0, internalized: 0 };
-  for (const card of cards) {
-    if (!card.suspended) maturity[cardMaturity(card)] += 1;
-  }
+  for (const card of cards) maturity[cardMaturity(card)] += 1;
 
   const week = bucketWeek(reviews, now);
 

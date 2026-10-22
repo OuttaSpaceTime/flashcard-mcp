@@ -6,7 +6,7 @@ interface MasterRow {
   type: string;
   name: string;
   tbl_name: string;
-  sql: string | null;
+  sql: string;
 }
 
 function quoteIdent(name: string): string {
@@ -32,12 +32,13 @@ function encodeValue(v: unknown): string {
   return escapeString(String(v));
 }
 
-export interface DumpResult {
+/** Table and row counts of a dumped or restored database. */
+export interface DbFileStats {
   tables: number;
   rows: number;
 }
 
-export function dumpDatabase(dbPath: string, outPath: string): DumpResult {
+export function dumpDatabase(dbPath: string, outPath: string): DbFileStats {
   if (!existsSync(dbPath)) {
     throw new Error(`Source database not found: ${dbPath}`);
   }
@@ -52,7 +53,6 @@ export function dumpDatabase(dbPath: string, outPath: string): DumpResult {
         `SELECT type, name, tbl_name, sql FROM sqlite_master
          WHERE sql IS NOT NULL
            AND name NOT LIKE 'sqlite_%'
-           AND name != '_prisma_migrations'
          ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'index' THEN 2 WHEN 'view' THEN 3 WHEN 'trigger' THEN 4 ELSE 5 END`,
       )
       .all() as MasterRow[];
@@ -63,7 +63,7 @@ export function dumpDatabase(dbPath: string, outPath: string): DumpResult {
       parts.push(`DROP TABLE IF EXISTS ${quoteIdent(t.name)};`);
     }
     for (const o of objects) {
-      if (o.sql != null) parts.push(`${o.sql};`);
+      parts.push(`${o.sql};`);
     }
 
     let totalRows = 0;
@@ -87,6 +87,9 @@ export function dumpDatabase(dbPath: string, outPath: string): DumpResult {
       }
     }
 
+    // The schema fingerprint (src/db/schema-sync.ts): without it a restored
+    // database reads as never synced, and the next start pushes and backs up.
+    parts.push(`PRAGMA user_version=${Number(db.pragma("user_version", { simple: true }))};`);
     parts.push("COMMIT;");
 
     mkdirSync(dirname(outPath), { recursive: true });
@@ -97,37 +100,22 @@ export function dumpDatabase(dbPath: string, outPath: string): DumpResult {
   }
 }
 
-export interface RestoreOptions {
-  force?: boolean;
-}
-
-export interface RestoreResult {
-  tables: number;
-  rows: number;
-}
-
 export function restoreDatabase(
   dbPath: string,
   sqlPath: string,
-  opts: RestoreOptions,
-): RestoreResult {
+  { force = false }: { force?: boolean } = {},
+): DbFileStats {
   if (!existsSync(sqlPath)) {
     throw new Error(`SQL dump not found: ${sqlPath}`);
   }
-  if (existsSync(dbPath) && opts.force !== true) {
-    throw new Error(
-      `Refusing to overwrite existing database: ${dbPath} (pass force:true / --force to override)`,
-    );
-  }
-  if (existsSync(dbPath) && opts.force === true) {
-    // Use Database to open+overwrite cleanly; easier: remove files
-    try {
-      rmSync(dbPath, { force: true });
-      rmSync(dbPath + "-journal", { force: true });
-      rmSync(dbPath + "-wal", { force: true });
-      rmSync(dbPath + "-shm", { force: true });
-    } catch {
-      // best-effort
+  if (existsSync(dbPath)) {
+    if (!force) {
+      throw new Error(
+        `Refusing to overwrite existing database: ${dbPath} (pass force:true / --force to override)`,
+      );
+    }
+    for (const suffix of ["", "-journal", "-wal", "-shm"]) {
+      rmSync(dbPath + suffix, { force: true });
     }
   }
 
@@ -137,11 +125,6 @@ export function restoreDatabase(
   const db = new Database(dbPath);
   try {
     db.exec(sql);
-    const tablesRow = db
-      .prepare(
-        `SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`,
-      )
-      .get() as { n: number };
     const tableNames = (
       db
         .prepare(
@@ -156,7 +139,7 @@ export function restoreDatabase(
         .get() as { n: number };
       rows += r.n;
     }
-    return { tables: tablesRow.n, rows };
+    return { tables: tableNames.length, rows };
   } finally {
     db.close();
   }

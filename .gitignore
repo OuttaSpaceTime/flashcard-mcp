@@ -2,8 +2,6 @@ node_modules/
 build/
 prisma/*.db
 prisma/*.db-journal
-.dumps/
-*.tsbuildinfo
 .env
 .claude/
 prisma/*.db.bak-*

@@ -2,29 +2,31 @@
  * Anki Notes in Plain Text (.txt) import/export.
  *
  * Format: tab-separated (or configurable separator) with optional
- * #header directives for metadata, tags, guid, deck, notetype.
+ * #header directives for the separator and the tags, guid and deck columns.
+ * Fields are HTML either way (cards here are simple HTML), so `#html` is
+ * written for Anki and not read back.
  *
  * Spec: https://docs.ankiweb.net/importing/text-files.html
  */
+
+import { getDb } from "../db/client.js";
+import { importCards, type ImportItem, type ImportOptions, type ImportResult } from "./card-import.js";
+import { parseTags } from "./types.js";
 
 export interface AnkiNote {
   front: string;
   back: string;
   tags?: string[];
+  /** Written on export (the card id) so Anki matches a re-import; not read back. */
   guid?: string;
   deck?: string;
-  notetype?: string;
 }
 
 interface ParseHeaders {
   separator: string;
-  html: boolean;
   tagsColumn?: number; // 1-based
-  guidColumn?: number; // 1-based
   deckColumn?: number; // 1-based
-  notetypeColumn?: number; // 1-based
   deckValue?: string; // from #deck:value
-  notetypeValue?: string; // from #notetype:value
 }
 
 const SEPARATOR_MAP: Record<string, string> = {
@@ -43,10 +45,7 @@ function parseHeaderLines(lines: string[]): {
   headers: ParseHeaders;
   dataStartIndex: number;
 } {
-  const headers: ParseHeaders = {
-    separator: "\t",
-    html: false,
-  };
+  const headers: ParseHeaders = { separator: "\t" };
 
   let i = 0;
   while (i < lines.length && lines[i].startsWith("#")) {
@@ -57,19 +56,9 @@ function parseHeaderLines(lines: string[]): {
       headers.separator = parseSeparatorName(sepMatch[1].trim());
     }
 
-    const htmlMatch = line.match(/^#html:(true|false)$/i);
-    if (htmlMatch) {
-      headers.html = htmlMatch[1].toLowerCase() === "true";
-    }
-
     const tagsColMatch = line.match(/^#tags[\s_]?column:(\d+)$/i);
     if (tagsColMatch) {
       headers.tagsColumn = parseInt(tagsColMatch[1]);
-    }
-
-    const guidColMatch = line.match(/^#guid[\s_]?column:(\d+)$/i);
-    if (guidColMatch) {
-      headers.guidColumn = parseInt(guidColMatch[1]);
     }
 
     const deckColMatch = line.match(/^#deck[\s_]?column:(\d+)$/i);
@@ -77,19 +66,9 @@ function parseHeaderLines(lines: string[]): {
       headers.deckColumn = parseInt(deckColMatch[1]);
     }
 
-    const notetypeColMatch = line.match(/^#notetype[\s_]?column:(\d+)$/i);
-    if (notetypeColMatch) {
-      headers.notetypeColumn = parseInt(notetypeColMatch[1]);
-    }
-
     const deckValMatch = line.match(/^#deck:(.+)$/);
-    if (deckValMatch && !line.match(/^#deck[\s_]?column:/i)) {
+    if (deckValMatch) {
       headers.deckValue = deckValMatch[1].trim();
-    }
-
-    const notetypeValMatch = line.match(/^#notetype:(.+)$/);
-    if (notetypeValMatch && !line.match(/^#notetype[\s_]?column:/i)) {
-      headers.notetypeValue = notetypeValMatch[1].trim();
     }
 
     i++;
@@ -153,14 +132,10 @@ function splitRecord(line: string, separator: string): string[] {
  */
 function joinMultilineRecords(lines: string[]): string[] {
   const records: string[] = [];
-  let current = "";
+  let current: string | null = null;
 
   for (const line of lines) {
-    if (current.length > 0) {
-      current += "\n" + line;
-    } else {
-      current = line;
-    }
+    current = current === null ? line : current + "\n" + line;
 
     // Count unescaped quotes
     let quoteCount = 0;
@@ -177,11 +152,11 @@ function joinMultilineRecords(lines: string[]): string[] {
     // Even number of quotes means the record is complete
     if (quoteCount % 2 === 0) {
       records.push(current);
-      current = "";
+      current = null;
     }
   }
 
-  if (current.length > 0) {
+  if (current !== null) {
     records.push(current);
   }
 
@@ -191,25 +166,21 @@ function joinMultilineRecords(lines: string[]): string[] {
 export function parseAnkiTxt(content: string): AnkiNote[] {
   if (content.trim() === "") return [];
 
-  const rawLines = content.split("\n");
+  const rawLines = content.split(/\r?\n/);
   const { headers, dataStartIndex } = parseHeaderLines(rawLines);
 
-  // Filter data lines (skip empty, skip # comments after headers)
-  const dataLines = rawLines
-    .slice(dataStartIndex)
-    .filter((l) => l.trim().length > 0 && !l.startsWith("#"));
-
-  if (dataLines.length === 0) return [];
-
-  // Join multi-line records
-  const records = joinMultilineRecords(dataLines);
+  // Records first, so a blank line or a leading # inside a quoted field stays
+  // part of it; only whole empty or comment records are dropped.
+  const records = joinMultilineRecords(rawLines.slice(dataStartIndex)).filter(
+    (r) => r.trim().length > 0 && !r.startsWith("#")
+  );
 
   return records.map((record) => {
     const fields = splitRecord(record, headers.separator);
 
     const note: AnkiNote = {
-      front: fields[0] ?? "",
-      back: fields[1] ?? "",
+      front: (fields[0] ?? "").trim(),
+      back: (fields[1] ?? "").trim(),
     };
 
     const col = (n: number | undefined) =>
@@ -221,26 +192,12 @@ export function parseAnkiTxt(content: string): AnkiNote[] {
       note.tags = tagsStr !== "" ? tagsStr.split(/\s+/) : [];
     }
 
-    // GUID from column
-    const guid = col(headers.guidColumn);
-    if (guid !== undefined) {
-      note.guid = guid !== "" ? guid : undefined;
-    }
-
     // Deck from column or header value
     const deck = col(headers.deckColumn);
     if (deck !== undefined) {
       note.deck = deck !== "" ? deck : undefined;
     } else if (headers.deckValue !== undefined) {
       note.deck = headers.deckValue;
-    }
-
-    // Notetype from column or header value
-    const notetype = col(headers.notetypeColumn);
-    if (notetype !== undefined) {
-      note.notetype = notetype !== "" ? notetype : undefined;
-    } else if (headers.notetypeValue !== undefined) {
-      note.notetype = headers.notetypeValue;
     }
 
     return note;
@@ -288,85 +245,42 @@ export function exportToAnkiTxt(notes: AnkiNote[]): string {
   return lines.join("\n");
 }
 
-// --- Shared import/export service functions ---
-
-import { getDb } from "../db/client.js";
-import { createCard } from "./card-service.js";
-import { assertCanCreateCard } from "./pressure.js";
-import { parseTags, serializeTags } from "./types.js";
-
+/**
+ * Import parsed notes, each into `opts.deck` when given, else the deck its
+ * file names (a deck column or `#deck:`). Throws before writing anything when
+ * a note has neither.
+ */
 export async function importTxtNotes(
   notes: AnkiNote[],
-  deckId: string,
-  opts: { dryRun?: boolean; conflict?: "ours" | "theirs" } = {}
-): Promise<{ created: number; updated: number; duplicates: number; skipped: number }> {
-  const { dryRun = false, conflict = "ours" } = opts;
-  const db = getDb();
-
-  // An import is one deliberate act with all the material in hand, so pressure
-  // is checked once here and the per-card gate is skipped below. Gating each
-  // note would abort mid-loop and leave the import half-applied; dry runs check
-  // too, so they never promise a count a real run would refuse.
-  await assertCanCreateCard();
-
-  let created = 0;
-  let updated = 0;
-  let duplicates = 0;
-  let skipped = 0;
-
+  opts: ImportOptions & { deck?: string } = {}
+): Promise<ImportResult> {
+  const byDeck = new Map<string, ImportItem[]>();
+  let deckless = 0;
   for (const note of notes) {
-    if (note.front.trim() === "") {
-      skipped++;
+    const deck = opts.deck ?? note.deck;
+    if (deck == null) {
+      deckless++;
       continue;
     }
-
-    const existing = await db.card.findFirst({
-      where: { deckId, front: note.front },
-    });
-
-    if (existing) {
-      if (conflict === "theirs") {
-        updated++;
-        if (!dryRun) {
-          await db.card.update({
-            where: { id: existing.id },
-            data: {
-              back: note.back,
-              tags: serializeTags(note.tags),
-            },
-          });
-        }
-      } else {
-        duplicates++;
-      }
-      continue;
-    }
-
-    if (!dryRun) {
-      await createCard({
-        deckId,
-        front: note.front,
-        back: note.back,
-        tags: note.tags,
-        skipPressureGate: true,
-      });
-    }
-    created++;
+    byDeck.set(deck, [...(byDeck.get(deck) ?? []), { front: note.front, back: note.back, tags: note.tags }]);
+  }
+  if (deckless > 0) {
+    throw new Error(`${deckless} note(s) name no deck: give one with --deck`);
   }
 
-  return { created, updated, duplicates, skipped };
+  return importCards(
+    [...byDeck].map(([name, items]) => ({ name, items })),
+    opts
+  );
 }
 
 export async function exportCardsToAnkiTxt(
   deckId?: string
 ): Promise<{ cardCount: number; content: string }> {
-  const db = getDb();
-  const where = deckId ? { deckId } : {};
-
-  const cards = await db.card.findMany({
-    where,
+  const cards = await getDb().card.findMany({
+    where: deckId != null ? { deckId } : {},
     include: { deck: { select: { name: true } } },
-    orderBy: { createdAt: "asc" as const },
+    orderBy: { createdAt: "asc" },
   });
 
   const content = exportToAnkiTxt(

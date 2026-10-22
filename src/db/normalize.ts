@@ -23,8 +23,8 @@ export const DATETIME_COLUMNS: ReadonlyArray<readonly [table: string, column: st
   ["Review", "reviewedAt"],
   ["StudySession", "startTime"],
   ["StudySession", "endTime"],
-  ["Topic", "createdAt"],
-  ["LearningGoal", "createdAt"],
+  ["CardNote", "createdAt"],
+  ["CardNote", "updatedAt"],
   ["DeletedCard", "deletedAt"],
 ];
 

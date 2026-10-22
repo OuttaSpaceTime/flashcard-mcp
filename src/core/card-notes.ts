@@ -1,4 +1,4 @@
-import type { Card, CardNote } from "@prisma/client";
+import type { CardNote } from "@prisma/client";
 import { getDb } from "../db/client.js";
 
 /**
@@ -30,10 +30,23 @@ export async function setCardNote(cardId: string, body: string): Promise<CardNot
   });
 }
 
+/** The card fields a note's reader shows beside it. */
+export interface NotedCard {
+  front: string;
+  back: string;
+  tags: string;
+  lapses: number;
+  deck: { name: string };
+}
+
 /** Every open note with its card, oldest first: the order they were noted in. */
-export async function listCardNotes(): Promise<(CardNote & { card: Card & { deck: { name: string } } })[]> {
+export async function listCardNotes(): Promise<(CardNote & { card: NotedCard })[]> {
   return getDb().cardNote.findMany({
-    include: { card: { include: { deck: { select: { name: true } } } } },
+    include: {
+      card: {
+        select: { front: true, back: true, tags: true, lapses: true, deck: { select: { name: true } } },
+      },
+    },
     orderBy: { createdAt: "asc" },
   });
 }

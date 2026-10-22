@@ -1,31 +1,19 @@
-import { Rating, State } from "ts-fsrs";
-
-export { Rating, State };
-
 export type CardMaturity = "new" | "learning" | "familiar" | "internalized";
 export type CardType = "guided" | "unguided";
 
+/**
+ * Session settings a caller may override per session. The saved values and
+ * their defaults live in the Config table (schema.prisma).
+ */
 export interface MasterConfig {
   maxNewCardsPerSession: number;
   maxReviewCardsPerSession: number;
   practiceFirstMode: boolean;
 }
 
-export const DEFAULT_CONFIG: MasterConfig = {
-  maxNewCardsPerSession: 5,
-  maxReviewCardsPerSession: 15,
-  practiceFirstMode: true,
-};
-
-export interface DuplicateCheckResult {
-  isDuplicate: boolean;
-  reason?: string;
-  similarCards?: Array<{
-    id: string;
-    front: string;
-    similarity: number;
-  }>;
-}
+/** Card state names, indexed by ts-fsrs `State` (Card.state stores the index). */
+export const CARD_STATE_NAMES = ["new", "learning", "review", "relearning"] as const;
+export type CardStateName = (typeof CARD_STATE_NAMES)[number];
 
 export interface SessionQueueItem {
   cardId: string;

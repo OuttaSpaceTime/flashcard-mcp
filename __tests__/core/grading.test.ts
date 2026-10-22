@@ -29,6 +29,7 @@ function envelope(structured: unknown, extra: Record<string, unknown> = {}): str
 interface FakeClaude extends ClaudeProcess {
   sent: string | null;
   killed: boolean;
+  exited: boolean;
   finish(r: RunResult): void;
   die(): void;
 }

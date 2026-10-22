@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { State } from "ts-fsrs";
 import { createHandlers } from "../../src/app/handlers.js";
 import { dispatch } from "../../src/app/server.js";
-import { bucketWeek } from "../../src/app/overview.js";
+import { bucketWeek } from "../../src/core/overview.js";
 import { localDay } from "../../src/core/days.js";
 import { updateCard } from "../../src/core/card-service.js";
 import { createDeck } from "../../src/core/deck-service.js";
@@ -270,9 +270,11 @@ describe("app handlers", () => {
     expect(out.map((r) => r.id)).toEqual([a.id, b.id]);
   });
 
-  it("builds an overview: pending excludes new cards, maturity sums to the live deck", async () => {
+  it("builds an overview: pending excludes new cards, maturity sums to the unsuspended deck", async () => {
     await seed(2, { state: State.Review });
     await seed(3);
+    const [suspended] = await seed(1, { state: State.Review });
+    await getDb().card.update({ where: { id: suspended.id }, data: { suspended: true } });
     const o = (await h.overview({})) as {
       pending: unknown[];
       totalCards: number;

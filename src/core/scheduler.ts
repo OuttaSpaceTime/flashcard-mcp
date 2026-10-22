@@ -1,10 +1,10 @@
 import {
   fsrs,
   createEmptyCard,
+  Grades,
   State,
   type Card as FsrsCard,
   type Grade,
-  type RecordLogItem,
   type FSRS,
 } from "ts-fsrs";
 import type { CardMaturity } from "./types.js";
@@ -22,19 +22,17 @@ export type SchedulableCard = {
 
 export type ReviewResult = {
   card: SchedulableCard;
-  log: {
-    rating: number;
-    state: number;
-    due: Date;
-    stability: number;
-    difficulty: number;
-    elapsedDays: number;
-    review: Date;
-  };
+  /** Whole days since the card's previous review, as ts-fsrs counted them. */
+  elapsedDays: number;
 };
 
 /** Days of interval at which a review card counts as mature (Anki's convention). */
 export const MATURE_INTERVAL_DAYS = 21;
+
+/** A rating a review can carry: 1 Again, 2 Hard, 3 Good, 4 Easy. */
+export function isGrade(x: unknown): x is Grade {
+  return (Grades as readonly unknown[]).includes(x);
+}
 
 /**
  * Derive a card's maturity from its schedule.
@@ -49,29 +47,24 @@ export function cardMaturity(card: { state: number; interval: number }): CardMat
   return card.interval >= MATURE_INTERVAL_DAYS ? "internalized" : "familiar";
 }
 
-let scheduler: FSRS | null = null;
+/** One scheduler per request retention; undefined is ts-fsrs's own default. */
+const schedulers = new Map<number | undefined, FSRS>();
 
-function getScheduler(): FSRS {
-  scheduler ??= fsrs();
+function getScheduler(requestRetention?: number): FSRS {
+  let scheduler = schedulers.get(requestRetention);
+  if (scheduler === undefined) {
+    scheduler = fsrs(requestRetention === undefined ? {} : { request_retention: requestRetention });
+    schedulers.set(requestRetention, scheduler);
+  }
   return scheduler;
 }
 
 export function createNewFsrsCard(now?: Date): SchedulableCard {
-  const card = createEmptyCard(now);
-  return fromFsrsCard(card);
+  return fromFsrsCard(createEmptyCard(now));
 }
 
-/** Convert any object with scheduling fields to a SchedulableCard */
-export function toSchedulableCard(card: {
-  due: Date;
-  stability: number;
-  difficulty: number;
-  reps: number;
-  lapses: number;
-  state: number;
-  lastReview: Date | null;
-  interval: number;
-}): SchedulableCard {
+/** The scheduling fields of any card-shaped object (a Prisma row, say). */
+export function toSchedulableCard(card: SchedulableCard): SchedulableCard {
   return {
     due: card.due,
     stability: card.stability,
@@ -84,61 +77,32 @@ export function toSchedulableCard(card: {
   };
 }
 
-function toFsrsCard(prismaCard: SchedulableCard): FsrsCard {
-  const elapsedDays =
-    prismaCard.lastReview != null
-      ? Math.max(
-          0,
-          (prismaCard.due.getTime() - prismaCard.lastReview.getTime()) /
-            (1000 * 60 * 60 * 24)
-        )
-      : 0;
-
+function toFsrsCard(card: SchedulableCard): FsrsCard {
   return {
-    due: prismaCard.due,
-    stability: prismaCard.stability,
-    difficulty: prismaCard.difficulty,
-    elapsed_days: elapsedDays,
-    scheduled_days: prismaCard.interval,
-    reps: prismaCard.reps,
-    lapses: prismaCard.lapses,
-    state: prismaCard.state as State,
-    last_review: prismaCard.lastReview ?? undefined,
-  } as FsrsCard;
+    due: card.due,
+    stability: card.stability,
+    difficulty: card.difficulty,
+    // ts-fsrs derives elapsed time from last_review and the review time itself
+    // (the scheduler's init, and get_retrievability), never from this field.
+    elapsed_days: 0,
+    scheduled_days: card.interval,
+    reps: card.reps,
+    lapses: card.lapses,
+    state: card.state as State,
+    last_review: card.lastReview ?? undefined,
+  };
 }
 
 function fromFsrsCard(fsrsCard: FsrsCard): SchedulableCard {
   return {
-    due: fsrsCard.due instanceof Date ? fsrsCard.due : new Date(fsrsCard.due),
+    due: fsrsCard.due,
     stability: fsrsCard.stability,
     difficulty: fsrsCard.difficulty,
     reps: fsrsCard.reps,
     lapses: fsrsCard.lapses,
-    state: fsrsCard.state as number,
-    lastReview: fsrsCard.last_review
-      ? fsrsCard.last_review instanceof Date
-        ? fsrsCard.last_review
-        : new Date(fsrsCard.last_review)
-      : null,
+    state: fsrsCard.state,
+    lastReview: fsrsCard.last_review ?? null,
     interval: fsrsCard.scheduled_days,
-  };
-}
-
-function toReviewResult(item: RecordLogItem): ReviewResult {
-  return {
-    card: fromFsrsCard(item.card),
-    log: {
-      rating: item.log.rating,
-      state: item.log.state,
-      due: item.log.due instanceof Date ? item.log.due : new Date(item.log.due),
-      stability: item.log.stability,
-      difficulty: item.log.difficulty,
-      elapsedDays: item.log.elapsed_days,
-      review:
-        item.log.review instanceof Date
-          ? item.log.review
-          : new Date(item.log.review),
-    },
   };
 }
 
@@ -149,12 +113,11 @@ function toReviewResult(item: RecordLogItem): ReviewResult {
  * properly learned. Recover by re-initializing it as a New card so this
  * review acts as the first learning step.
  */
-function sanitizeForReview(prismaCard: SchedulableCard): SchedulableCard {
-  const stabilityValid =
-    Number.isFinite(prismaCard.stability) && prismaCard.stability > 0;
-  if (prismaCard.state !== State.New && !stabilityValid) {
+function sanitizeForReview(card: SchedulableCard): SchedulableCard {
+  const stabilityValid = Number.isFinite(card.stability) && card.stability > 0;
+  if (card.state !== State.New && !stabilityValid) {
     return {
-      ...prismaCard,
+      ...card,
       stability: 0,
       difficulty: 0,
       state: State.New,
@@ -162,33 +125,28 @@ function sanitizeForReview(prismaCard: SchedulableCard): SchedulableCard {
       interval: 0,
     };
   }
-  return prismaCard;
+  return card;
 }
 
+/**
+ * Apply a rating. `requestRetention` is the recall probability FSRS schedules
+ * the next review at (Config.requestRetention); omitted, ts-fsrs's default.
+ */
 export function reviewCard(
-  prismaCard: SchedulableCard,
+  card: SchedulableCard,
   rating: Grade,
-  now?: Date
+  now: Date = new Date(),
+  requestRetention?: number
 ): ReviewResult {
-  const f = getScheduler();
-  const fsrsCard = toFsrsCard(sanitizeForReview(prismaCard));
-  const item = f.next(fsrsCard, now ?? new Date(), rating);
-  return toReviewResult(item);
+  const item = getScheduler(requestRetention).next(toFsrsCard(sanitizeForReview(card)), now, rating);
+  return { card: fromFsrsCard(item.card), elapsedDays: item.log.elapsed_days };
 }
 
-export function getRetrievability(
-  prismaCard: SchedulableCard,
-  now?: Date
-): number {
-  if (prismaCard.state === State.New || prismaCard.lastReview == null) {
-    return 0;
-  }
-
-  const f = getScheduler();
-  const fsrsCard = toFsrsCard(prismaCard);
-  const r = f.get_retrievability(fsrsCard, now ?? new Date());
-  if (typeof r === "string") {
-    return parseFloat(r) / 100;
-  }
-  return r;
+/**
+ * Probability of recalling the card at `now`, 0 for a card never reviewed. The
+ * forgetting curve depends on stability alone, so no request retention here.
+ */
+export function getRetrievability(card: SchedulableCard, now: Date = new Date()): number {
+  if (card.state === State.New || card.lastReview == null) return 0;
+  return getScheduler().get_retrievability(toFsrsCard(card), now, false);
 }

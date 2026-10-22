@@ -23,7 +23,6 @@ model Card {
   tags       String    @default("")
   category   String?
   type       String    @default("guided")
-  source     String?
   // Parent card id when this row was created via createCard's inheritFrom
   // (a split/derive). Marks it as deck maintenance, not new intake.
   inheritedFrom String?
@@ -101,33 +100,10 @@ model StudySession {
   @@index([startTime])
 }
 
-model Topic {
-  id            String         @id @default(cuid())
-  name          String         @unique
-  priority      Int            @default(5)
-  maturityLevel String         @default("beginner")
-  deckName      String?
-  goals         LearningGoal[]
-  createdAt     DateTime       @default(now())
-}
-
-model LearningGoal {
-  id          String   @id @default(cuid())
-  topicId     String
-  topic       Topic    @relation(fields: [topicId], references: [id], onDelete: Cascade)
-  description String
-  type        String   @default("guided")
-  status      String   @default("active")
-  createdAt   DateTime @default(now())
-
-  @@index([topicId])
-}
-
 model Config {
   id                       String  @id @default("default")
   maxNewCardsPerSession    Int     @default(5)
   maxReviewCardsPerSession Int     @default(15)
-  sessionDurationMinutes   Int     @default(15)
   requestRetention         Float   @default(0.9)
   practiceFirstMode        Boolean @default(true)
 }

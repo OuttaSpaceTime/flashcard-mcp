@@ -176,13 +176,14 @@ describe("pressure", () => {
   });
 
   describe("newAvailable reporting", () => {
-    it("counts due unsuspended new cards only", async () => {
+    // The pool a session draws from: a New card's due is not a schedule.
+    it("counts every unsuspended new card, whatever its due", async () => {
       await seedCards(2, { state: State.New });
       await seedCards(1, { state: State.New, suspended: true });
       await seedCards(1, { state: State.New, due: futureDue() });
       await seedCards(1, { state: State.Review });
 
-      expect((await checkPressure()).newAvailable).toBe(2);
+      expect((await checkPressure()).newAvailable).toBe(3);
     });
   });
 
