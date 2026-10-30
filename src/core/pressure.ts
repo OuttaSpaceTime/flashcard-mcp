@@ -8,7 +8,7 @@ import { startOfLocalDay } from "./days.js";
 export const WARN_FLASHCARDS = 20;
 export const PAUSE_FLASHCARDS = 50;
 export const WARN_NEW_TODAY = 5;
-export const PAUSE_NEW_TODAY = 10;
+export const PAUSE_NEW_TODAY = 15;
 
 export type PressureVerdict = "ok" | "warn" | "pause";
 

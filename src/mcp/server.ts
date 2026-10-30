@@ -248,7 +248,7 @@ export function createServer(): McpServer {
     "create_card",
     {
       description:
-        "Create a new flashcard. Returns the card and, when it resembles existing cards in the same deck, a duplicateWarning; the card is created even when duplicateWarning.isDuplicate is true. When splitting or deriving a card from an existing one, pass inheritFrom with the source card's id so the new card keeps the parent's FSRS schedule (due, stability, interval, state) instead of resetting to a fresh New card. Creation is blocked with an error while check_pressure reads pause (50+ reviews due, or 10+ cards added today); splits via inheritFrom are exempt. Front and back are simple HTML, the only format Anki renders reliably; content that breaks the rules on those two parameters is rejected with an error listing each violation.",
+        "Create a new flashcard. Returns the card and, when it resembles existing cards in the same deck, a duplicateWarning; the card is created even when duplicateWarning.isDuplicate is true. When splitting or deriving a card from an existing one, pass inheritFrom with the source card's id so the new card keeps the parent's FSRS schedule (due, stability, interval, state) instead of resetting to a fresh New card. Creation is blocked with an error while check_pressure reads pause (50+ reviews due, or 15+ cards added today); splits via inheritFrom are exempt. Front and back are simple HTML, the only format Anki renders reliably; content that breaks the rules on those two parameters is rejected with an error listing each violation.",
       inputSchema: {
         deckId: z.string().describe("Deck id from list_decks, not the deck name"),
         front: z

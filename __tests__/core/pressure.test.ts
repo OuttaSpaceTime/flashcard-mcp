@@ -230,7 +230,7 @@ describe("pressure", () => {
       await seedCards(PAUSE_NEW_TODAY, { state: State.New, createdAt: new Date() });
       const p = await checkPressure();
       expect(p.verdict).toBe("pause");
-      expect(p.reasons).toEqual(["10 cards added today (>= 10)"]);
+      expect(p.reasons).toEqual(["15 cards added today (>= 15)"]);
     });
   });
 
@@ -248,7 +248,7 @@ describe("pressure", () => {
       await seedCards(PAUSE_NEW_TODAY, { state: State.New, createdAt: new Date() });
       const p = await checkPressure();
       expect(p.verdict).toBe("pause");
-      expect(p.reasons).toEqual(["20 flashcards due", "10 cards added today (>= 10)"]);
+      expect(p.reasons).toEqual(["20 flashcards due", "15 cards added today (>= 15)"]);
     });
 
     it("all-new due deck reads ok: new cards are an optional pool, not backlog", async () => {
@@ -320,7 +320,7 @@ describe("pressure", () => {
     it("throws at pause on the cards-added-today axis", async () => {
       await seedCards(PAUSE_NEW_TODAY, { state: State.New, createdAt: new Date() });
       await expect(assertCanCreateCard()).rejects.toThrow(
-        /10 cards added today \(pause at 10\)/
+        /15 cards added today \(pause at 15\)/
       );
     });
   });
@@ -337,7 +337,7 @@ describe("pressure", () => {
       await seedCards(PAUSE_NEW_TODAY, { state: State.New, createdAt: new Date() });
       await expect(
         createCard({ deckId: testDeckId, front: "one more", back: "a" })
-      ).rejects.toThrow(/10 cards added today/);
+      ).rejects.toThrow(/15 cards added today/);
     });
 
     it("createCard with inheritFrom succeeds at pause and records provenance", async () => {
