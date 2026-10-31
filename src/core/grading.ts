@@ -1,9 +1,9 @@
-import { spawn } from "node:child_process";
+import Anthropic from "@anthropic-ai/sdk";
 import type { Grade } from "ts-fsrs";
 import { isGrade } from "./scheduler.js";
 
 /**
- * Suggested ratings for typed answers, from `claude -p`.
+ * Suggested ratings for typed answers, from the Claude API.
  *
  * This is the /study skill's evaluation step (rate on the unaided answer, one or
  * two sentences of reason) moved out of a chat session so a GUI can use it: the
@@ -16,31 +16,36 @@ import { isGrade } from "./scheduler.js";
  * move with that number, or the cheapest way to "fix" low retention would be to
  * grade more leniently.
  *
- * Claude runs bare: no tools, no MCP servers, no settings or CLAUDE.md files, no
- * saved session. That keeps a grade to about three seconds, and stops the
- * grader from wandering into the wiki or the deck when the card back is all it
- * should judge against.
+ * One Messages API call per grade: no tools, the card back the only thing it
+ * judges against, the verdict a structured output against GRADE_SCHEMA. Sonnet
+ * as before, with thinking off (`between_tools` is Sonnet 5.5's lowest setting)
+ * and effort low: the rubric is the judgement, and the reply is two sentences.
+ * Server-side fallback is on, so a security card the cyber classifier declines
+ * is graded by the fallback model instead of failing.
  *
- * About a second of those three is `claude` starting up, so the `Grader` keeps
- * one booted ahead (a spare) for as long as a session is open, and the app
- * grades while the developer pauses typing, so a grade is often done by the
- * time they reveal. The spare holds nothing of a card (the prompt is all
- * there is of one), so it lives from card to card: ending it with each card
- * would only boot an identical one, a second of CPU per card.
- * Each grade still gets a fresh process: sending a changed answer to the same
- * conversation would save nothing on the model's side (it reads it all again)
- * and would let the earlier draft and its verdict sway the rating. The spare
- * takes its prompt as a stream-json message, because a plain-text `claude -p`
- * gives up on stdin after three seconds and runs with no prompt.
+ * It ran on `claude -p` first, and was moved off it (2026-10-30) because a
+ * grade took about three seconds there: a second of the CLI starting (hidden
+ * behind a spare process booted ahead), and a second turn the CLI spends on
+ * `--json-schema`. The API answers in one round trip, 1.5-2.5s (measured on
+ * the fixture deck, 2026-10-30). The cost is that grades
+ * bill an API key rather than the Claude subscription, about $0.003 each; the
+ * key comes from the environment (ANTHROPIC_API_KEY), which Omvida's deck
+ * script fills from the login keyring.
  *
- * Measured and rejected (2026-10-19, 15 cards, Sonnet): `--effort low` changed
- * neither the time nor the ratings (no thinking happens at the default), and
- * asking for the JSON in the prompt instead of `--json-schema` saves the second
- * turn but was slower overall (median 5.4s against 3.7s) and moved two ratings.
+ * The app grades once per card, on the reveal (it graded on every pause in
+ * the typing while grades were free). The `Grader` still runs at most one,
+ * aborting a grade the next card or a newer request makes moot, so nothing
+ * is billed for a verdict nobody will see. Each grade is a fresh request,
+ * never a turn added to the last one: an earlier draft and its verdict must
+ * not sway the rating.
  */
 
-const GRADE_MODEL = "sonnet";
-const GRADE_TIMEOUT_MS = 60_000;
+const GRADE_MODEL = "claude-sonnet-5-5";
+// One attempt's deadline, and one retry (on a 429, a 5xx or a dropped
+// connection): a grade gives up within a minute, under the app's request
+// timeout (Omvida's Config.requestTimeout).
+const GRADE_TIMEOUT_MS = 25_000;
+const GRADE_RETRIES = 1;
 
 /** Card quality problems the grader may flag, from /study's quality check. */
 const QUALITY_ISSUES = [
@@ -69,27 +74,6 @@ export interface GradeSuggestion {
   /** null when the card itself looked fine. */
   quality: { issue: Exclude<QualityIssue, "none">; detail: string } | null;
 }
-
-export interface RunResult {
-  code: number | null;
-  stdout: string;
-  stderr: string;
-}
-
-/**
- * A `claude` that has been started and waits for its one prompt. `send` writes
- * the prompt and closes stdin, and resolves when the process exits; `kill`
- * ends it, sent or not, and a pending `send` rejects. `exited` is true once the
- * process is gone or killed: it can take no prompt.
- */
-export interface ClaudeProcess {
-  send(stdin: string, timeoutMs: number): Promise<RunResult>;
-  kill(): void;
-  readonly exited: boolean;
-}
-
-/** Starts `claude` with argv. Injected in tests. */
-export type ClaudeStarter = (argv: string[]) => ClaudeProcess;
 
 export const GRADE_SCHEMA = {
   type: "object",
@@ -133,70 +117,27 @@ export function buildGradePrompt(input: GradeInput): string {
   ].join("\n");
 }
 
-export function gradeArgv(): string[] {
-  return [
-    "-p",
-    "--model", GRADE_MODEL,
-    "--input-format", "stream-json",
-    "--output-format", "stream-json",
-    "--verbose",
-    "--json-schema", JSON.stringify(GRADE_SCHEMA),
-    "--system-prompt", GRADE_SYSTEM_PROMPT,
-    "--tools", "",
-    "--strict-mcp-config",
-    "--setting-sources", "",
-    "--no-session-persistence",
-  ];
-}
-
-/** The prompt as the one stream-json message the grader reads from stdin. */
-export function gradeMessage(input: GradeInput): string {
-  return JSON.stringify({ type: "user", message: { role: "user", content: buildGradePrompt(input) } }) + "\n";
-}
 
 /**
- * The result envelope in claude's stream-json output: the last line of type
- * "result", after the init and message lines.
+ * The request for one grade. The system prompt carries a cache breakpoint: it
+ * is the same on every grade, and under the model's minimum cacheable length
+ * the API just ignores it.
  */
-function resultEnvelope(stdout: string): Record<string, unknown> | null {
-  const lines = stdout.split("\n").filter((l) => l.trim() !== "");
-  for (let i = lines.length - 1; i >= 0; i--) {
-    let ev: unknown;
-    try {
-      ev = JSON.parse(lines[i]);
-    } catch {
-      continue;
-    }
-    if (ev == null || typeof ev !== "object" || Array.isArray(ev)) continue;
-    if ((ev as Record<string, unknown>).type === "result") return ev as Record<string, unknown>;
-  }
-  return null;
+export function gradeRequest(input: GradeInput): Anthropic.Beta.Messages.MessageCreateParamsNonStreaming {
+  return {
+    model: GRADE_MODEL,
+    max_tokens: 1024,
+    system: [{ type: "text", text: GRADE_SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
+    messages: [{ role: "user", content: buildGradePrompt(input) }],
+    thinking: { type: "between_tools" },
+    output_config: { effort: "low", format: { type: "json_schema", schema: GRADE_SCHEMA } },
+    betas: ["server-side-fallback-2026-07-01"],
+    fallbacks: "default",
+  };
 }
 
-/**
- * Reads claude's result envelope. The structured answer is in
- * `structured_output`; `result` carries the same object as a JSON string, used
- * as a fallback in case a CLI version leaves the first one out. `noResult` is
- * the error when there is no envelope at all (how claude exited, if it failed).
- */
-export function parseGradeOutput(stdout: string, noResult = "grader returned no JSON"): GradeSuggestion {
-  const envelope = resultEnvelope(stdout);
-  if (envelope == null) throw new Error(noResult);
-  if (envelope.is_error === true) {
-    const msg = typeof envelope.result === "string" ? envelope.result : "unknown error";
-    throw new Error(`grader failed: ${msg}`);
-  }
-
-  let out = envelope.structured_output as Record<string, unknown> | undefined;
-  if (out == null && typeof envelope.result === "string") {
-    try {
-      out = JSON.parse(envelope.result) as Record<string, unknown>;
-    } catch {
-      out = undefined;
-    }
-  }
-  if (out == null) throw new Error("grader returned no structured output");
-
+/** Checks the structured verdict and reshapes it. */
+export function toSuggestion(out: Record<string, unknown>): GradeSuggestion {
   const rating = out.rating;
   if (!isGrade(rating)) {
     throw new Error(`grader returned an invalid rating: ${String(rating)}`);
@@ -214,114 +155,105 @@ export function parseGradeOutput(stdout: string, noResult = "grader returned no 
   return { rating, reason, quality };
 }
 
-export const startClaude = (argv: string[], command = "claude"): ClaudeProcess => {
-  const child = spawn(command, argv, { stdio: ["pipe", "pipe", "pipe"] });
-  let stdout = "";
-  let stderr = "";
-  let exited = false;
-  let cancel: (err: Error) => void = () => {};
-  // The process's one outcome, settled by whichever comes first: its exit,
-  // a failure to start, or a kill. A spare killed unused has nobody waiting.
-  const done = new Promise<RunResult>((resolve, reject) => {
-    cancel = reject;
-    child.on("error", (err) => reject(new Error(`could not start claude: ${err.message}`)));
-    child.on("close", (code) => resolve({ code, stdout, stderr }));
-  });
-  done.catch(() => {});
-  child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
-  child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-  // `exit`, not `close`: close waits for the output too, which a child of the
-  // process can hold open after a kill.
-  child.on("exit", () => (exited = true));
-  child.on("error", () => (exited = true));
-  // Writing to a process that is already gone fails with EPIPE; that must not
-  // take the server down. `done` reports it instead.
-  child.stdin.on("error", () => {});
-  return {
-    get exited() {
-      return exited;
-    },
-    async send(stdin, timeoutMs) {
-      child.stdin.end(stdin);
-      let timer: NodeJS.Timeout | undefined;
-      const timeout = new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => {
-          child.kill("SIGTERM");
-          reject(new Error(`grader timed out after ${Math.round(timeoutMs / 1000)}s`));
-        }, timeoutMs);
-      });
-      try {
-        return await Promise.race([done, timeout]);
-      } finally {
-        clearTimeout(timer);
-      }
-    },
-    kill() {
-      exited = true;
-      child.kill("SIGTERM");
-      cancel(new Error("grade cancelled"));
-    },
-  };
-};
+/**
+ * Reads the API's reply: the stop reason first (a declined or cut-off reply
+ * has no whole verdict), then the JSON in its text block.
+ */
+export function parseGradeMessage(msg: Anthropic.Beta.Messages.BetaMessage): GradeSuggestion {
+  if (msg.stop_reason === "refusal") {
+    const category = msg.stop_details?.category;
+    throw new Error(`grader declined this card${category != null ? ` (${category})` : ""}`);
+  }
+  if (msg.stop_reason === "max_tokens") throw new Error("grader's reply was cut off");
+  const text = msg.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("");
+  let out: unknown;
+  try {
+    out = JSON.parse(text);
+  } catch {
+    throw new Error("grader returned no JSON");
+  }
+  if (out == null || typeof out !== "object" || Array.isArray(out)) throw new Error("grader returned no JSON");
+  return toSuggestion(out as Record<string, unknown>);
+}
+
+/** Sends one grade request. Injected in tests. */
+export type GradeCall = (
+  body: Anthropic.Beta.Messages.MessageCreateParamsNonStreaming,
+  signal: AbortSignal
+) => Promise<Anthropic.Beta.Messages.BetaMessage>;
+
+let client: Anthropic | null = null;
 
 /**
- * The app's grades: at most one running, and one spare `claude` booted and
- * waiting for the next prompt while a session is open.
- *
- * The app grades while the developer types, so grades overlap: a newer answer
- * ends the grade still running, since only the newest can be shown. A request
- * claims its process as it arrives, before the handler awaits anything (the
- * card lookup), so requests are ordered as they came: an older one that gets
- * there late finds its process already killed. `endGrade()` ends the grade
- * of a card that is done with; `close()` ends the spare too.
+ * The real call. The client is made on the first grade, so a deck server with
+ * no key starts and serves everything else, and the grade says what is missing.
+ */
+export const callApi: GradeCall = async (body, signal) => {
+  if ((process.env.ANTHROPIC_API_KEY ?? "") === "") {
+    throw new Error("no API key: the deck server needs ANTHROPIC_API_KEY to grade");
+  }
+  client ??= new Anthropic({ timeout: GRADE_TIMEOUT_MS, maxRetries: GRADE_RETRIES });
+  return client.beta.messages.create(body, { signal });
+};
+
+/** One line for the app's verdict, from what the call threw. */
+function describeError(err: unknown): string {
+  if (err instanceof Anthropic.APIConnectionTimeoutError) {
+    return `grader timed out after ${Math.round(GRADE_TIMEOUT_MS / 1000)}s`;
+  }
+  if (err instanceof Anthropic.APIConnectionError) return "grader could not reach the Claude API";
+  if (err instanceof Anthropic.AuthenticationError) return "grader's API key was refused";
+  if (err instanceof Anthropic.RateLimitError) return "grader is rate limited: try again in a moment";
+  if (err instanceof Anthropic.APIError) {
+    const body = err.error as { error?: { message?: unknown } } | undefined;
+    const message = typeof body?.error?.message === "string" ? body.error.message : err.message;
+    return `grader failed (${String(err.status)}): ${message}`;
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * The app's grades, at most one running: a newer request aborts the grade
+ * still running, since only the newest can be shown. A request claims its slot as it arrives, before the
+ * handler awaits anything (the card lookup), so requests are ordered as they
+ * came: an older one that gets there late finds its claim already aborted.
+ * `endGrade()` ends the grade of a card that is done with.
  */
 export class Grader {
-  private spare: ClaudeProcess | null = null;
-  private running: ClaudeProcess | null = null;
+  private running: AbortController | null = null;
 
-  constructor(private readonly start: ClaudeStarter = startClaude) {}
+  constructor(private readonly call: GradeCall = callApi) {}
 
-  /** Boot a claude for the next grade, if none is waiting. */
-  prepare(): void {
-    if (this.spare == null || this.spare.exited) this.spare = this.start(gradeArgv());
+  /** Aborts the grade still running and claims the slot for a new one. */
+  claim(): AbortController {
+    this.running?.abort();
+    this.running = new AbortController();
+    return this.running;
   }
 
-  /**
-   * Ends the grade still running and takes the spare (or a fresh claude when
-   * there is none) for a new one; another spare boots for the next grade.
-   */
-  claim(): ClaudeProcess {
-    this.running?.kill();
-    let proc = this.spare;
-    this.spare = null;
-    if (proc == null || proc.exited) proc = this.start(gradeArgv());
-    this.running = proc;
-    this.spare = this.start(gradeArgv());
-    return proc;
-  }
-
-  /** Grades `input` on a claimed process. */
-  async grade(proc: ClaudeProcess, input: GradeInput): Promise<GradeSuggestion> {
+  /** Grades `input` under a claim. */
+  async grade(claim: AbortController, input: GradeInput): Promise<GradeSuggestion> {
+    // A function, not the property read twice: TypeScript would keep the first
+    // read's narrowing across the await, though an abort can come in between.
+    const aborted = (): boolean => claim.signal.aborted;
     try {
-      const result = await proc.send(gradeMessage(input), GRADE_TIMEOUT_MS);
-      const firstLine = result.stderr.trim().split("\n")[0] ?? "";
-      const exit = `grader exited ${String(result.code)}${firstLine !== "" ? `: ${firstLine}` : ""}`;
-      return parseGradeOutput(result.stdout, result.code !== 0 ? exit : undefined);
+      if (aborted()) throw new Error("grade cancelled");
+      let msg: Anthropic.Beta.Messages.BetaMessage;
+      try {
+        msg = await this.call(gradeRequest(input), claim.signal);
+      } catch (err) {
+        if (aborted() || err instanceof Anthropic.APIUserAbortError) throw new Error("grade cancelled");
+        throw new Error(describeError(err));
+      }
+      return parseGradeMessage(msg);
     } finally {
-      if (this.running === proc) this.running = null;
+      if (this.running === claim) this.running = null;
     }
   }
 
-  /** The card is done with: end its grade still running. */
+  /** The card is done with, or the session: end its grade still running. */
   endGrade(): void {
-    this.running?.kill();
+    this.running?.abort();
     this.running = null;
-  }
-
-  /** The session is over: end the grade still running and the spare. */
-  close(): void {
-    this.endGrade();
-    this.spare?.kill();
-    this.spare = null;
   }
 }

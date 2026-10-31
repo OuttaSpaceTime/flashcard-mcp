@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { State } from "ts-fsrs";
 import { createHandlers } from "../../src/app/handlers.js";
 import { dispatch } from "../../src/app/server.js";
@@ -7,7 +7,8 @@ import { localDay } from "../../src/core/days.js";
 import { updateCard } from "../../src/core/card-service.js";
 import { createDeck } from "../../src/core/deck-service.js";
 import { getDb } from "../../src/db/client.js";
-import type { ClaudeStarter } from "../../src/core/grading.js";
+import type Anthropic from "@anthropic-ai/sdk";
+import type { GradeCall } from "../../src/core/grading.js";
 
 let deckId: string;
 
@@ -37,31 +38,32 @@ async function seed(count: number, overrides: Partial<{ state: number; due: Date
   return out;
 }
 
-const started: string[][] = [];
-let killed = 0;
-const fakeGrader: ClaudeStarter = (argv) => {
-  started.push(argv);
-  let sent = false;
+// The grades sent, and how many were aborted before an answer came.
+const sent: string[] = [];
+let aborted = 0;
+const fakeGrade: GradeCall = async (body, signal) => {
+  sent.push(body.messages[0].content as string);
+  // "slowly" waits to be aborted; anything else answers at once.
+  if ((body.messages[0].content as string).includes("slowly")) {
+    await new Promise((_resolve, reject) =>
+      signal.addEventListener("abort", () => {
+        aborted++;
+        reject(new Error("aborted"));
+      })
+    );
+  }
   return {
-    get exited() {
-      return sent;
-    },
-    send: async () => {
-      sent = true;
-      return {
-        code: 0,
-        stdout: JSON.stringify({ type: "result", is_error: false, structured_output: { rating: 3, reason: "Correct.", quality_issue: "none" } }),
-        stderr: "",
-      };
-    },
-    kill: () => {
-      if (!sent) killed++;
-    },
-  };
+    id: "msg",
+    type: "message",
+    role: "assistant",
+    model: "claude-sonnet-5-5",
+    content: [{ type: "text", text: JSON.stringify({ rating: 3, reason: "Correct.", quality_issue: "none" }) }],
+    stop_reason: "end_turn",
+  } as Anthropic.Beta.Messages.BetaMessage;
 };
 
 describe("app handlers", () => {
-  const h = createHandlers({ starter: fakeGrader });
+  const h = createHandlers({ gradeCall: fakeGrade });
 
   beforeEach(async () => {
     deckId = (await createDeck("Web")).id;
@@ -230,28 +232,30 @@ describe("app handlers", () => {
     expect(out[1].noted).toEqual([b.id]);
   });
 
-  it("grades on the spare nextCard booted, keeps a spare across cards, and ends it with the session", async () => {
+  it("grades, and the next card or the session's end aborts a grade still running", async () => {
     await seed(2, { state: State.Review });
     const s = (await h.startSession({})) as { sessionId: string };
-    await h.nextCard({ sessionId: s.sessionId });
-    started.length = 0;
-    killed = 0;
-    const next = (await h.nextCard({ sessionId: s.sessionId })) as { card: { id: string } };
-    expect(started).toHaveLength(0);   // the spare from before is still up
-    const g = (await h.grade({ cardId: next.card.id, answer: "Answer 1" })) as { rating: number; reason: string };
+    const first = (await h.nextCard({ sessionId: s.sessionId })) as { card: { id: string } };
+    const g = (await h.grade({ cardId: first.card.id, answer: "Answer 1" })) as { rating: number; reason: string };
     expect(g).toMatchObject({ rating: 3, reason: "Correct." });
-    expect(started).toHaveLength(1);   // the spare for the next grade
-    await h.nextCard({ sessionId: s.sessionId });
-    expect(killed).toBe(0);
+    aborted = 0;
+    const slow = h.grade({ cardId: first.card.id, answer: "slowly" });
+    await vi.waitFor(() => expect(sent.at(-1)).toContain("slowly"));
+    const next = (await h.nextCard({ sessionId: s.sessionId })) as { card: { id: string } };
+    await expect(slow).rejects.toThrow(/cancelled/);
+    expect(aborted).toBe(1);
+    const slow2 = h.grade({ cardId: next.card.id, answer: "slowly again" });
+    await vi.waitFor(() => expect(sent.at(-1)).toContain("slowly again"));
     await h.endSession({ sessionId: s.sessionId });
-    expect(killed).toBe(1);
+    await expect(slow2).rejects.toThrow(/cancelled/);
+    expect(aborted).toBe(2);
   });
 
-  it("refuses to grade an empty answer without starting claude", async () => {
+  it("refuses to grade an empty answer without calling the API", async () => {
     const [card] = await seed(1);
-    started.length = 0;
+    sent.length = 0;
     await expect(h.grade({ cardId: card.id, answer: "  " })).rejects.toThrow(/empty/);
-    expect(started).toHaveLength(0);
+    expect(sent).toHaveLength(0);
   });
 
   it("rejects a rating outside 1-4", async () => {

@@ -16,7 +16,7 @@ import { recentlyStudied } from "../core/analytics-service.js";
 import { changeTokens } from "../core/change-tokens.js";
 import { deferLeech, leechPayload } from "../core/leeches.js";
 import { CARD_STATE_NAMES, parseTags, type CardStateName } from "../core/types.js";
-import { Grader, type ClaudeStarter } from "../core/grading.js";
+import { Grader, type GradeCall } from "../core/grading.js";
 import { getOverview } from "../core/overview.js";
 import { recentSessions } from "../core/recent-sessions.js";
 import { listCardNotes, setCardNote } from "../core/card-notes.js";
@@ -38,11 +38,11 @@ import { localDay } from "../core/days.js";
  * - `nextCard` also carries `schedules`, what each rating 1-4 would schedule
  *   (submitReview's shape, keyed by rating), so the rating keys can say where
  *   they send the card. /study has no keys to label.
- * - `grade` suggests a rating from `claude -p` (core/grading.ts), and the
- *   session drives its processes: `nextCard` ends the last card's grade and
- *   makes sure a spare claude is booted, `endSession` ends both. So a card
- *   rated without waiting for Claude leaves no grade running, and the app has
- *   no lifecycle of its own to keep. /study grades in the chat instead.
+ * - `grade` suggests a rating from the Claude API (core/grading.ts), and the
+ *   session ends its requests: `nextCard` and `endSession` abort the last
+ *   card's grade. So a card rated without waiting for Claude leaves no grade
+ *   running, and the app has no lifecycle of its own to keep. /study grades
+ *   in the chat instead.
  * - App-only reads with no MCP tool: `overview`, `cards` (the whole deck),
  *   `stamp` (change tokens to poll), `notes`/`setNote`, `sessions`,
  *   `recentlyStudied`.
@@ -104,8 +104,8 @@ function optNum(params: Record<string, unknown>, key: string): number | undefine
 
 export type Handler = (params: Record<string, unknown>) => Promise<unknown>;
 
-export function createHandlers(deps: { starter?: ClaudeStarter } = {}): Record<string, Handler> {
-  const grader = new Grader(deps.starter);
+export function createHandlers(deps: { gradeCall?: GradeCall } = {}): Record<string, Handler> {
+  const grader = new Grader(deps.gradeCall);
   return {
     overview: async (p) => getOverview({ pendingLimit: optNum(p, "pendingLimit") }),
 
@@ -124,8 +124,7 @@ export function createHandlers(deps: { starter?: ClaudeStarter } = {}): Record<s
       };
     },
 
-    // The last card's grade ends here (it was rated, skipped or deleted), and
-    // the spare is there for the new card's first grade.
+    // The last card's grade ends here: it was rated, skipped or deleted.
     nextCard: async (p) => {
       const sessionId = str(p, "sessionId");
       grader.endGrade();
@@ -138,7 +137,6 @@ export function createHandlers(deps: { starter?: ClaudeStarter } = {}): Record<s
       const { card } = next;
       const position = await getQueuePosition(sessionId);
       const leech = leechPayload(card);
-      grader.prepare();
       return {
         card: toAppCard(card, names.get(card.deckId) ?? ""),
         position: position?.position ?? null,
@@ -149,19 +147,19 @@ export function createHandlers(deps: { starter?: ClaudeStarter } = {}): Record<s
       };
     },
 
-    // The process is claimed before the card lookup awaits, so overlapping
+    // The grade is claimed before the card lookup awaits, so overlapping
     // grades keep the order they came in (Grader).
     grade: async (p) => {
       const cardId = str(p, "cardId");
       const answer = typeof p.answer === "string" ? p.answer : "";
       if (answer.trim() === "") throw new Error("nothing to grade: the answer is empty");
-      const proc = grader.claim();
+      const claim = grader.claim();
       const card = await getCard(cardId);
       if (card == null) {
-        proc.kill();
+        claim.abort();
         throw new Error(`Card not found: ${cardId}`);
       }
-      return grader.grade(proc, { front: card.front, back: card.back, answer });
+      return grader.grade(claim, { front: card.front, back: card.back, answer });
     },
 
     review: async (p) => {
@@ -173,7 +171,7 @@ export function createHandlers(deps: { starter?: ClaudeStarter } = {}): Record<s
     skip: async (p) => ({ skipped: await skipCard(str(p, "sessionId")) }),
 
     endSession: async (p) => {
-      grader.close();
+      grader.endGrade();
       return endSession(str(p, "sessionId"));
     },
 
