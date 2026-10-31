@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import Anthropic from "@anthropic-ai/sdk";
 import {
   buildGradePrompt,
@@ -9,15 +9,15 @@ import {
   type GradeCall,
 } from "../../src/core/grading.js";
 
-type Message = Anthropic.Beta.Messages.BetaMessage;
-type Body = Anthropic.Beta.Messages.MessageCreateParamsNonStreaming;
+type Message = Anthropic.Messages.Message;
+type Body = Anthropic.Messages.MessageCreateParamsNonStreaming;
 
 function reply(verdict: unknown, extra: Partial<Message> = {}): Message {
   return {
     id: "msg_1",
     type: "message",
     role: "assistant",
-    model: "claude-sonnet-5-5",
+    model: "claude-haiku-5-5",
     content: [{ type: "text", text: typeof verdict === "string" ? verdict : JSON.stringify(verdict) }],
     stop_reason: "end_turn",
     ...extra,
@@ -42,20 +42,19 @@ function fakeApi(): { call: GradeCall; calls: Pending[] } {
   return { call, calls };
 }
 
-const ok = (rating: number) => reply({ rating, reason: "Fine.", quality_issue: "none" });
+const ok = (rating: number) => reply({ rating, reason: "Fine." });
 const card = (answer: string) => ({ front: "Q", back: "A", answer });
 
 describe("grading", () => {
-  it("asks Sonnet with no tools and no thinking, for the verdict as structured output", () => {
+  it("asks Haiku at low effort with no tools, for the rating as structured output", () => {
     const req = gradeRequest(card("my answer"));
-    expect(req.model).toBe("claude-sonnet-5-5");
+    expect(req.model).toBe("claude-haiku-5-5");
     expect(req.tools).toBeUndefined();
-    expect(req.thinking).toEqual({ type: "between_tools" });
+    expect(req.thinking).toBeUndefined();
     expect(req.output_config).toEqual({ effort: "low", format: { type: "json_schema", schema: GRADE_SCHEMA } });
-    expect(req.fallbacks).toBe("default");
-    expect(req.betas).toEqual(["server-side-fallback-2026-07-01"]);
+    expect(Object.keys(GRADE_SCHEMA.properties)).toEqual(["rating", "reason"]);
     expect(req.messages).toEqual([{ role: "user", content: buildGradePrompt(card("my answer")) }]);
-    const system = req.system as Anthropic.Beta.Messages.BetaTextBlockParam[];
+    const system = req.system as Anthropic.Messages.TextBlockParam[];
     expect(system[0].text).toMatch(/fixed rubric/);
   });
 
@@ -67,31 +66,19 @@ describe("grading", () => {
   });
 
   it("parses the structured output", () => {
-    const out = parseGradeMessage(reply({ rating: 2, reason: " Missing the TTL. ", quality_issue: "none" }));
-    expect(out).toEqual({ rating: 2, reason: "Missing the TTL.", quality: null });
+    const out = parseGradeMessage(reply({ rating: 2, reason: " Missing the TTL. " }));
+    expect(out).toEqual({ rating: 2, reason: "Missing the TTL." });
   });
 
   it("reads past a thinking block to the text", () => {
-    const m = reply({ rating: 3, reason: "Right.", quality_issue: "none" });
-    m.content = [{ type: "thinking", thinking: "", signature: "s" } as Anthropic.Beta.Messages.BetaContentBlock, ...m.content];
+    const m = reply({ rating: 3, reason: "Right." });
+    m.content = [{ type: "thinking", thinking: "", signature: "s" } as Anthropic.Messages.ContentBlock, ...m.content];
     expect(parseGradeMessage(m).rating).toBe(3);
   });
 
-  it("reports a card quality issue with its detail", () => {
-    const out = parseGradeMessage(
-      reply({ rating: 3, reason: "Right.", quality_issue: "two_questions", quality_detail: "Asks two things." })
-    );
-    expect(out.quality).toEqual({ issue: "two_questions", detail: "Asks two things." });
-  });
-
-  it("drops an unknown quality issue rather than inventing one", () => {
-    const out = parseGradeMessage(reply({ rating: 3, reason: "Right.", quality_issue: "made_up" }));
-    expect(out.quality).toBeNull();
-  });
-
   it("rejects an invalid rating, a missing reason, non-JSON, a cut-off reply and a refusal", () => {
-    expect(() => parseGradeMessage(reply({ rating: 5, reason: "x", quality_issue: "none" }))).toThrow(/invalid rating/);
-    expect(() => parseGradeMessage(reply({ rating: 3, reason: "  ", quality_issue: "none" }))).toThrow(/no reason/);
+    expect(() => parseGradeMessage(reply({ rating: 5, reason: "x" }))).toThrow(/invalid rating/);
+    expect(() => parseGradeMessage(reply({ rating: 3, reason: "  " }))).toThrow(/no reason/);
     expect(() => parseGradeMessage(reply("not json"))).toThrow(/no JSON/);
     expect(() => parseGradeMessage(reply("{\"rating\": 3", { stop_reason: "max_tokens" }))).toThrow(/cut off/);
     const refused = reply("", { stop_reason: "refusal" });
@@ -107,6 +94,24 @@ describe("grading", () => {
     expect(calls[0].body).toEqual(gradeRequest(card("draft")));
     calls[0].answer(ok(2));
     expect((await p).rating).toBe(2);
+  });
+
+  it("asks Sonnet once when Haiku declines, and shows a second decline", async () => {
+    const { call, calls } = fakeApi();
+    const g = new Grader(call);
+    const declined = reply("", { stop_reason: "refusal" });
+    const p = g.grade(g.claim(), card("csrf"));
+    calls[0].answer(declined);
+    await vi.waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[1].body.model).toBe("claude-sonnet-5-5");
+    calls[1].answer(ok(3));
+    expect((await p).rating).toBe(3);
+
+    const q = g.grade(g.claim(), card("csrf again"));
+    calls[2].answer(declined);
+    await vi.waitFor(() => expect(calls).toHaveLength(4));
+    calls[3].answer(declined);
+    await expect(q).rejects.toThrow(/declined/);
   });
 
   it("a newer claim aborts the grade still running, even one not yet sent", async () => {

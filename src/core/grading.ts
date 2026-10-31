@@ -17,19 +17,30 @@ import { isGrade } from "./scheduler.js";
  * grade more leniently.
  *
  * One Messages API call per grade: no tools, the card back the only thing it
- * judges against, the verdict a structured output against GRADE_SCHEMA. Sonnet
- * as before, with thinking off (`between_tools` is Sonnet 5.5's lowest setting)
- * and effort low: the rubric is the judgement, and the reply is two sentences.
- * Server-side fallback is on, so a security card the cyber classifier declines
- * is graded by the fallback model instead of failing.
+ * judges against, the verdict a structured output against GRADE_SCHEMA. Haiku,
+ * at effort low with thinking left adaptive (Haiku 5.5's advice over turning it
+ * off): with the answer key in the prompt, rating is reading comprehension.
+ * Compared with Sonnet on 30 real cards (2026-10-30, through `claude -p`): the
+ * same pass/fail on 28, and on the 2 it differed Haiku was the stricter and
+ * arguably right. Haiku has no server-side refusal fallback, and a deck of
+ * web-security cards is what a cyber classifier may decline: a declined grade
+ * is asked of Sonnet once (FALLBACK_MODEL), which declines fewer benign
+ * requests. Declined again, it shows the decline and is rated by hand.
+ *
+ * Grading only rates. It also judged the card's quality until 2026-10-31; that
+ * moved out of the study loop: a check the developer asks for (Omvida's
+ * Ctrl+Q, the study repo's /study-card-check) and a gate on every card written
+ * in the study repo (its card-quality hook), so a flawed card is fixed by
+ * Claude Code rather than flagged to the developer mid-review.
  *
  * It ran on `claude -p` first, and was moved off it (2026-10-30) because a
  * grade took about three seconds there: a second of the CLI starting (hidden
  * behind a spare process booted ahead), and a second turn the CLI spends on
- * `--json-schema`. The API answers in one round trip, 1.5-2.5s (measured on
- * the fixture deck, 2026-10-30). The cost is that grades
- * bill an API key rather than the Claude subscription, about $0.003 each; the
- * key comes from the environment (ANTHROPIC_API_KEY), which Omvida's deck
+ * `--json-schema`. The API answers in one round trip: Haiku in 1.0-1.2s, the
+ * first grade of a server's life 2.6s with the connection (Sonnet took
+ * 1.5-2.5s; both measured on the fixture deck, 2026-10-30/31). The cost is that grades bill an
+ * API key rather than the Claude subscription (Haiku: about $0.00015 each);
+ * the key comes from the environment (ANTHROPIC_API_KEY), which Omvida's deck
  * script fills from the login keyring.
  *
  * The app grades once per card, on the reveal (it graded on every pause in
@@ -40,27 +51,13 @@ import { isGrade } from "./scheduler.js";
  * not sway the rating.
  */
 
-const GRADE_MODEL = "claude-sonnet-5-5";
+const GRADE_MODEL = "claude-haiku-5-5";
+const FALLBACK_MODEL = "claude-sonnet-5-5";
 // One attempt's deadline, and one retry (on a 429, a 5xx or a dropped
 // connection): a grade gives up within a minute, under the app's request
 // timeout (Omvida's Config.requestTimeout).
 const GRADE_TIMEOUT_MS = 25_000;
 const GRADE_RETRIES = 1;
-
-/** Card quality problems the grader may flag, from /study's quality check. */
-const QUALITY_ISSUES = [
-  "none",
-  "too_vague",
-  "too_broad",
-  "outdated",
-  "ambiguous_front",
-  "opinion_bait",
-  "mismatched",
-  "cloze",
-  "verbose_answer",
-  "two_questions",
-] as const;
-export type QualityIssue = (typeof QUALITY_ISSUES)[number];
 
 export interface GradeInput {
   front: string;
@@ -71,8 +68,6 @@ export interface GradeInput {
 export interface GradeSuggestion {
   rating: Grade;
   reason: string;
-  /** null when the card itself looked fine. */
-  quality: { issue: Exclude<QualityIssue, "none">; detail: string } | null;
 }
 
 export const GRADE_SCHEMA = {
@@ -80,10 +75,8 @@ export const GRADE_SCHEMA = {
   properties: {
     rating: { type: "integer", enum: [1, 2, 3, 4] },
     reason: { type: "string" },
-    quality_issue: { type: "string", enum: [...QUALITY_ISSUES] },
-    quality_detail: { type: "string" },
   },
-  required: ["rating", "reason", "quality_issue"],
+  required: ["rating", "reason"],
   additionalProperties: false,
 } as const;
 
@@ -99,9 +92,7 @@ Rate the unaided answer against the back, with this fixed rubric:
 
 Judge substance, not wording. A terse answer that names the right idea is Good. Do not reward padding, and do not penalise typos or informal phrasing. When the developer says they don't know, rate Again.
 
-The reason is one or two plain sentences addressed to the developer as "you". Say what was right and, on a weak answer, name the missing piece plainly: seeing the gap at once is the point. Do not ask a question back, and do not add a lecture.
-
-Also check the card itself. Set quality_issue to "none" unless the card has a real problem: too_vague (the back is too thin to learn from), too_broad (the front covers several concepts), outdated (deprecated API or pattern), ambiguous_front (unclear without the back), opinion_bait (asks for a "best" or "single most" with no single answer), mismatched (asks what, answers why, or the reverse), cloze (contains {{c1::...}}), verbose_answer (the back pads with a restated question or a second idea), two_questions (the front asks two things). Do not flag a card for being short when its back is precise. When you flag one, quality_detail says what is wrong in one sentence.`;
+The reason is one or two plain sentences addressed to the developer as "you". Say what was right and, on a weak answer, name the missing piece plainly: seeing the gap at once is the point. Do not ask a question back, and do not add a lecture.`;
 
 export function buildGradePrompt(input: GradeInput): string {
   return [
@@ -121,18 +112,16 @@ export function buildGradePrompt(input: GradeInput): string {
 /**
  * The request for one grade. The system prompt carries a cache breakpoint: it
  * is the same on every grade, and under the model's minimum cacheable length
- * the API just ignores it.
+ * the API just ignores it. max_tokens leaves room for thinking, which counts
+ * toward it.
  */
-export function gradeRequest(input: GradeInput): Anthropic.Beta.Messages.MessageCreateParamsNonStreaming {
+export function gradeRequest(input: GradeInput, model: string = GRADE_MODEL): Anthropic.Messages.MessageCreateParamsNonStreaming {
   return {
-    model: GRADE_MODEL,
-    max_tokens: 1024,
+    model,
+    max_tokens: 2048,
     system: [{ type: "text", text: GRADE_SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
     messages: [{ role: "user", content: buildGradePrompt(input) }],
-    thinking: { type: "between_tools" },
     output_config: { effort: "low", format: { type: "json_schema", schema: GRADE_SCHEMA } },
-    betas: ["server-side-fallback-2026-07-01"],
-    fallbacks: "default",
   };
 }
 
@@ -144,22 +133,14 @@ export function toSuggestion(out: Record<string, unknown>): GradeSuggestion {
   }
   const reason = typeof out.reason === "string" ? out.reason.trim() : "";
   if (reason === "") throw new Error("grader returned no reason");
-
-  const issue = out.quality_issue;
-  const detail = typeof out.quality_detail === "string" ? out.quality_detail.trim() : "";
-  const quality =
-    typeof issue === "string" && issue !== "none" && (QUALITY_ISSUES as readonly string[]).includes(issue)
-      ? { issue: issue as Exclude<QualityIssue, "none">, detail }
-      : null;
-
-  return { rating, reason, quality };
+  return { rating, reason };
 }
 
 /**
  * Reads the API's reply: the stop reason first (a declined or cut-off reply
  * has no whole verdict), then the JSON in its text block.
  */
-export function parseGradeMessage(msg: Anthropic.Beta.Messages.BetaMessage): GradeSuggestion {
+export function parseGradeMessage(msg: Anthropic.Messages.Message): GradeSuggestion {
   if (msg.stop_reason === "refusal") {
     const category = msg.stop_details?.category;
     throw new Error(`grader declined this card${category != null ? ` (${category})` : ""}`);
@@ -178,9 +159,9 @@ export function parseGradeMessage(msg: Anthropic.Beta.Messages.BetaMessage): Gra
 
 /** Sends one grade request. Injected in tests. */
 export type GradeCall = (
-  body: Anthropic.Beta.Messages.MessageCreateParamsNonStreaming,
+  body: Anthropic.Messages.MessageCreateParamsNonStreaming,
   signal: AbortSignal
-) => Promise<Anthropic.Beta.Messages.BetaMessage>;
+) => Promise<Anthropic.Messages.Message>;
 
 let client: Anthropic | null = null;
 
@@ -193,7 +174,7 @@ export const callApi: GradeCall = async (body, signal) => {
     throw new Error("no API key: the deck server needs ANTHROPIC_API_KEY to grade");
   }
   client ??= new Anthropic({ timeout: GRADE_TIMEOUT_MS, maxRetries: GRADE_RETRIES });
-  return client.beta.messages.create(body, { signal });
+  return client.messages.create(body, { signal });
 };
 
 /** One line for the app's verdict, from what the call threw. */
@@ -238,9 +219,10 @@ export class Grader {
     const aborted = (): boolean => claim.signal.aborted;
     try {
       if (aborted()) throw new Error("grade cancelled");
-      let msg: Anthropic.Beta.Messages.BetaMessage;
+      let msg: Anthropic.Messages.Message;
       try {
         msg = await this.call(gradeRequest(input), claim.signal);
+        if (msg.stop_reason === "refusal") msg = await this.call(gradeRequest(input, FALLBACK_MODEL), claim.signal);
       } catch (err) {
         if (aborted() || err instanceof Anthropic.APIUserAbortError) throw new Error("grade cancelled");
         throw new Error(describeError(err));

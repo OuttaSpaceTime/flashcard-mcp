@@ -56,10 +56,10 @@ const fakeGrade: GradeCall = async (body, signal) => {
     id: "msg",
     type: "message",
     role: "assistant",
-    model: "claude-sonnet-5-5",
-    content: [{ type: "text", text: JSON.stringify({ rating: 3, reason: "Correct.", quality_issue: "none" }) }],
+    model: "claude-haiku-5-5",
+    content: [{ type: "text", text: JSON.stringify({ rating: 3, reason: "Correct." }) }],
     stop_reason: "end_turn",
-  } as Anthropic.Beta.Messages.BetaMessage;
+  } as Anthropic.Messages.Message;
 };
 
 describe("app handlers", () => {
