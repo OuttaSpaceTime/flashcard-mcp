@@ -50,6 +50,40 @@ function scopeWhere(filters: { category?: string; deckId?: string }): Prisma.Car
  */
 const sessions = new Map<string, SessionState>();
 
+/**
+ * What undoing one review puts back: the card's scheduling and leech fields, the
+ * session's counters and queue, all as they were just before it; and the review
+ * row to delete. Newest last, per session.
+ *
+ * In memory, unlike the queue: undo belongs to the run of the app that gave the
+ * rating, and a saved copy would have to outlive `queueState`, which an ended or
+ * exhausted session clears, since a slip on the last card is the likeliest one
+ * to want back. Forgotten at the next `startSession`; a restarted process has
+ * nothing to undo, and says so.
+ */
+interface ReviewUndo {
+  reviewId: string;
+  cardId: string;
+  rating: Grade;
+  card: Pick<
+    PrismaCard,
+    | "due"
+    | "stability"
+    | "difficulty"
+    | "reps"
+    | "lapses"
+    | "state"
+    | "lastReview"
+    | "interval"
+    | "leechFlaggedAt"
+    | "leechDeferredLapses"
+  >;
+  session: Pick<StudySession, "cardsReviewed" | "newCards" | "accuracy">;
+  /** The queue state as JSON: `topUpNewCard` and a skip edit a live state in place. */
+  state: string;
+}
+const reviewUndos = new Map<string, ReviewUndo[]>();
+
 /** The session's state from the cache, or from its row; undefined once ended. */
 async function loadState(sessionId: string): Promise<SessionState | undefined> {
   const cached = sessions.get(sessionId);
@@ -101,6 +135,7 @@ export async function startSession(
 ): Promise<StartSessionResult> {
   const db = getDb();
   await discardEmptySessions();
+  reviewUndos.clear();
 
   const { category, deckId, ...overrides } = configOverrides ?? {};
   const filters = {
@@ -323,8 +358,15 @@ export async function submitReview(
   }
 
   const db = getDb();
-  const card = await db.card.findUnique({ where: { id: cardId } });
+  const [card, row] = await Promise.all([
+    db.card.findUnique({ where: { id: cardId } }),
+    db.studySession.findUnique({
+      where: { id: sessionId },
+      select: { cardsReviewed: true, newCards: true, accuracy: true },
+    }),
+  ]);
   if (!card) throw new Error(`Card not found: ${cardId}`);
+  if (!row) throw new Error(`Session ${sessionId} does not exist`);
 
   const { requestRetention } = await readConfig();
   const now = new Date();
@@ -341,7 +383,7 @@ export async function submitReview(
     queue: schedule.intraDay ? [...state.queue, { cardId, reason: "learning_repeat" }] : state.queue,
   };
 
-  await db.$transaction([
+  const [, review] = await db.$transaction([
     // updatedAt stays: it means the card's content changed (the app's stamp,
     // handlers.ts), and a review is not that.
     db.card.update({
@@ -380,7 +422,78 @@ export async function submitReview(
   ]);
   sessions.set(sessionId, next);
 
+  const undos = reviewUndos.get(sessionId) ?? [];
+  undos.push({
+    reviewId: review.id,
+    cardId,
+    rating,
+    card: {
+      due: card.due,
+      stability: card.stability,
+      difficulty: card.difficulty,
+      reps: card.reps,
+      lapses: card.lapses,
+      state: card.state,
+      lastReview: card.lastReview,
+      interval: card.interval,
+      leechFlaggedAt: card.leechFlaggedAt,
+      leechDeferredLapses: card.leechDeferredLapses,
+    },
+    session: row,
+    state: JSON.stringify(state),
+  });
+  reviewUndos.set(sessionId, undos);
+
   return schedule;
+}
+
+/**
+ * Take back the session's newest review, and with it everything since: the card
+ * gets its scheduling back and the review row goes, and the session its counters
+ * and queue, so the same card is the next one served. Call it again for the one
+ * before. Returns the card and the rating undone, or null when nothing is left.
+ *
+ * It reopens a session that ended or ran out of cards. A skip since the review
+ * is undone with it (the position goes back), and the card's content is left as
+ * it now is. A review whose card has since been deleted went with the card, so
+ * it is passed over.
+ *
+ * A leech's flag is stamped when the card is served, so a card waiting at the
+ * restored position may already be flagged, and that would block the very card
+ * being given back. Such a flag is lifted here: serving the card stamps it again,
+ * with whatever lapses it has by then.
+ */
+export async function undoLastReview(
+  sessionId: string
+): Promise<{ cardId: string; rating: Grade } | null> {
+  const db = getDb();
+  const undos = reviewUndos.get(sessionId) ?? [];
+  for (let undo = undos.pop(); undo !== undefined; undo = undos.pop()) {
+    const card = await db.card.findUnique({ where: { id: undo.cardId }, select: { updatedAt: true } });
+    if (card == null) continue;
+
+    await db.$transaction([
+      db.card.update({ where: { id: undo.cardId }, data: { ...undo.card, updatedAt: card.updatedAt } }),
+      db.review.deleteMany({ where: { id: undo.reviewId } }),
+      db.studySession.update({
+        where: { id: sessionId },
+        data: { ...undo.session, endTime: null, queueState: undo.state },
+      }),
+    ]);
+    const state = JSON.parse(undo.state) as SessionState;
+    sessions.set(sessionId, state);
+
+    const waiting = new Set(state.queue.slice(state.pointer).map((item) => item.cardId));
+    for (const flagged of await findUnresolvedLeeches()) {
+      if (!waiting.has(flagged.id)) continue;
+      await db.card.update({
+        where: { id: flagged.id },
+        data: { leechFlaggedAt: null, updatedAt: flagged.updatedAt },
+      });
+    }
+    return { cardId: undo.cardId, rating: undo.rating };
+  }
+  return null;
 }
 
 /** A session as `endSession` reports it, dates as ISO strings. */

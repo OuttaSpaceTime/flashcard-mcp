@@ -6,6 +6,7 @@ import {
   getNextCard,
   getQueuePosition,
   submitReview,
+  undoLastReview,
   adjustSession,
   skipCard,
   endSession,
@@ -797,5 +798,139 @@ describe("session persistence", () => {
     const row = await db.studySession.findUnique({ where: { id: session.id } });
     expect(row?.queueState).toBeNull();
     expect(await (await restartedService()).getNextCard(session.id)).toBeNull();
+  });
+
+});
+
+describe("undoLastReview", () => {
+  beforeEach(async () => {
+    deckId = (await createDeck("Undo")).id;
+  });
+
+  const schedule = (c: { due: Date; stability: number; reps: number; lapses: number; state: number }) => ({
+    due: c.due.getTime(),
+    stability: c.stability,
+    reps: c.reps,
+    lapses: c.lapses,
+    state: c.state,
+  });
+  const row = (id: string) => getDb().studySession.findUniqueOrThrow({ where: { id } });
+
+  it("puts back the card, the review and the session, and serves the card again", async () => {
+    await seedCards(2);
+    const session = await startSession();
+    const served = await getNextCard(session.id);
+    await submitReview(session.id, served!.id, Rating.Again);
+
+    expect(await undoLastReview(session.id)).toEqual({ cardId: served!.id, rating: Rating.Again });
+
+    const card = await getDb().card.findUniqueOrThrow({ where: { id: served!.id } });
+    expect(schedule(card)).toEqual(schedule(served!));
+    expect(card.updatedAt.getTime()).toBe(served!.updatedAt.getTime());
+    expect(await getDb().review.count()).toBe(0);
+    const s = await row(session.id);
+    expect([s.cardsReviewed, s.newCards, s.accuracy]).toEqual([0, 0, 0]);
+    expect((await getNextCard(session.id))!.id).toBe(served!.id);
+    expect((await getQueuePosition(session.id))!.position).toBe(1);
+    // The Again's learning repeat went with it.
+    expect((await getQueuePosition(session.id))!.total).toBe(2);
+  });
+
+  it("goes back several reviews, newest first, then has none left", async () => {
+    await seedCards(3);
+    const session = await startSession();
+    const rated: string[] = [];
+    for (const rating of [Rating.Good, Rating.Easy, Rating.Easy] as Grade[]) {
+      const c = await getNextCard(session.id);
+      rated.push(c!.id);
+      await submitReview(session.id, c!.id, rating);
+    }
+    expect((await undoLastReview(session.id))!.cardId).toBe(rated[2]);
+    expect((await undoLastReview(session.id))!.cardId).toBe(rated[1]);
+    expect((await undoLastReview(session.id))!.cardId).toBe(rated[0]);
+    expect(await undoLastReview(session.id)).toBeNull();
+    expect(await getDb().review.count()).toBe(0);
+    expect((await getNextCard(session.id))!.id).toBe(rated[0]);
+  });
+
+  it("reopens a session that ended, or ran out of cards", async () => {
+    await seedCards(1);
+    const session = await startSession();
+    const c = await getNextCard(session.id);
+    await submitReview(session.id, c!.id, Rating.Easy);
+    expect(await getNextCard(session.id)).toBeNull();
+    await endSession(session.id);
+    expect((await row(session.id)).endTime).not.toBeNull();
+
+    await undoLastReview(session.id);
+
+    expect((await row(session.id)).endTime).toBeNull();
+    expect((await getNextCard(session.id))!.id).toBe(c!.id);
+    await submitReview(session.id, c!.id, Rating.Hard);
+    expect((await row(session.id)).cardsReviewed).toBe(1);
+  });
+
+  it("undoes a skip made since the review", async () => {
+    await seedCards(3);
+    const session = await startSession();
+    const first = await getNextCard(session.id);
+    await submitReview(session.id, first!.id, Rating.Easy);
+    await skipCard(session.id);
+    await undoLastReview(session.id);
+    expect((await getNextCard(session.id))!.id).toBe(first!.id);
+  });
+
+  it("passes over a review whose card has been deleted", async () => {
+    await seedCards(3);
+    const session = await startSession();
+    const first = await getNextCard(session.id);
+    await submitReview(session.id, first!.id, Rating.Easy);
+    const second = await getNextCard(session.id);
+    await submitReview(session.id, second!.id, Rating.Easy);
+    await deleteCard(second!.id);
+
+    expect((await undoLastReview(session.id))!.cardId).toBe(first!.id);
+    expect((await getNextCard(session.id))!.id).toBe(first!.id);
+  });
+
+  it("keeps the card's content as it now is", async () => {
+    await seedCards(1);
+    const session = await startSession();
+    const c = await getNextCard(session.id);
+    await submitReview(session.id, c!.id, Rating.Easy);
+    await getDb().card.update({ where: { id: c!.id }, data: { front: "Rewritten" } });
+    await undoLastReview(session.id);
+    expect((await getDb().card.findUniqueOrThrow({ where: { id: c!.id } })).front).toBe("Rewritten");
+  });
+
+  // The next card was flagged on its serve, and must not block the card
+  // given back; it is flagged again when it comes up.
+  it("lifts the flag of a leech still to come, which serving it stamps again", async () => {
+    const db = getDb();
+    const [a, b] = await seedCards(2);
+    await db.card.update({ where: { id: b.id }, data: { lapses: 6 } });
+    const session = await startSession();
+    expect((await getNextCard(session.id))!.id).toBe(a.id);
+    await submitReview(session.id, a.id, Rating.Easy);
+    const served = await getNextCard(session.id);
+    expect(served!.id).toBe(b.id);
+    expect(served!.leechFlaggedAt).not.toBeNull();
+
+    await undoLastReview(session.id);
+
+    expect((await getNextCard(session.id))!.id).toBe(a.id);
+    await submitReview(session.id, a.id, Rating.Easy);
+    expect((await getNextCard(session.id))!.leechFlaggedAt).not.toBeNull();
+  });
+
+  it("forgets it all at the next session", async () => {
+    await seedCards(2);
+    const session = await startSession();
+    const c = await getNextCard(session.id);
+    await submitReview(session.id, c!.id, Rating.Easy);
+    await endSession(session.id);
+    await startSession();
+    expect(await undoLastReview(session.id)).toBeNull();
+    expect(await getDb().review.count()).toBe(1);
   });
 });

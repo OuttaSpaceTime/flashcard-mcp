@@ -164,6 +164,25 @@ describe("app handlers", () => {
     expect(await stamp()).not.toBe(edited);
   });
 
+  it("undoes a review, serves its card again, and redoes it with the same rating", async () => {
+    await seed(2, { state: State.Review, due: new Date(Date.now() - 60_000) });
+    const h = createHandlers();
+    const s = (await h.startSession({})) as { sessionId: string };
+    const first = (await h.nextCard({ sessionId: s.sessionId })) as { card: { id: string } };
+    await h.review({ sessionId: s.sessionId, cardId: first.card.id, rating: 2 });
+
+    expect(await h.undoReview({ sessionId: s.sessionId })).toEqual({ cardId: first.card.id, rating: 2 });
+    expect(await getDb().review.count()).toBe(0);
+    const again = (await h.nextCard({ sessionId: s.sessionId })) as { card: { id: string }; position: number };
+    expect(again.card.id).toBe(first.card.id);
+    expect(again.position).toBe(1);
+
+    await h.review({ sessionId: s.sessionId, cardId: first.card.id, rating: 2 });
+    expect(await getDb().review.count()).toBe(1);
+    expect(await h.undoReview({ sessionId: s.sessionId })).toEqual({ cardId: first.card.id, rating: 2 });
+    expect(await h.undoReview({ sessionId: s.sessionId })).toBeNull();
+  });
+
   it("moves the reviews token, not the cards', on a review and a leech flag", async () => {
     await seed(1, { state: State.Review, lapses: 8 });
     const stamp = async () => (await h.stamp({})) as { stamp: string; reviews: string };

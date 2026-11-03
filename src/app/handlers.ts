@@ -5,6 +5,7 @@ import {
   getNextCardOrBlock,
   getQueuePosition,
   submitReview,
+  undoLastReview,
   previewSchedules,
   skipCard,
   endSession,
@@ -167,6 +168,10 @@ export function createHandlers(deps: { gradeCall?: GradeCall } = {}): Record<str
       if (!isGrade(rating)) throw new Error("rating must be 1, 2, 3 or 4");
       return submitReview(str(p, "sessionId"), str(p, "cardId"), rating, optNum(p, "responseMs"));
     },
+
+    // The session's newest review taken back, or null with none left. `nextCard`
+    // then serves its card again. Redo is `review` with the same rating.
+    undoReview: async (p) => undoLastReview(str(p, "sessionId")),
 
     skip: async (p) => ({ skipped: await skipCard(str(p, "sessionId")) }),
 
