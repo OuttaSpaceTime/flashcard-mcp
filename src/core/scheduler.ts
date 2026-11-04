@@ -1,11 +1,14 @@
 import {
   fsrs,
   createEmptyCard,
+  dateDiffInDays,
   Grades,
+  S_MIN,
   State,
   type Card as FsrsCard,
   type Grade,
   type FSRS,
+  type Steps,
 } from "ts-fsrs";
 import type { CardMaturity } from "./types.js";
 
@@ -18,6 +21,23 @@ export type SchedulableCard = {
   state: number;
   lastReview: Date | null;
   interval: number;
+  /** Position in the (re)learning steps; absent means the first. */
+  learningStep?: number;
+};
+
+/**
+ * What the scheduler needs besides the card. They mirror the Anki deck options
+ * (anki-sync copies them into Config), so a rating key shows what Anki shows.
+ * Omitted fields are Anki's defaults: steps 1m 10m / 10m, FSRS default weights,
+ * 0.9 retention. Fuzz stays off on purpose: Anki fuzzes day intervals, but the
+ * preview and the review run at different moments, so a fuzzed preview would
+ * promise an interval the review then does not give.
+ */
+export type SchedulerParams = {
+  requestRetention?: number;
+  learningSteps?: Steps;
+  relearningSteps?: Steps;
+  weights?: readonly number[];
 };
 
 export type ReviewResult = {
@@ -47,14 +67,19 @@ export function cardMaturity(card: { state: number; interval: number }): CardMat
   return card.interval >= MATURE_INTERVAL_DAYS ? "internalized" : "familiar";
 }
 
-/** One scheduler per request retention; undefined is ts-fsrs's own default. */
-const schedulers = new Map<number | undefined, FSRS>();
+const schedulers = new Map<string, FSRS>();
 
-function getScheduler(requestRetention?: number): FSRS {
-  let scheduler = schedulers.get(requestRetention);
+function getScheduler(params: SchedulerParams = {}): FSRS {
+  const key = JSON.stringify(params);
+  let scheduler = schedulers.get(key);
   if (scheduler === undefined) {
-    scheduler = fsrs(requestRetention === undefined ? {} : { request_retention: requestRetention });
-    schedulers.set(requestRetention, scheduler);
+    scheduler = fsrs({
+      ...(params.requestRetention !== undefined && { request_retention: params.requestRetention }),
+      ...(params.learningSteps !== undefined && { learning_steps: params.learningSteps }),
+      ...(params.relearningSteps !== undefined && { relearning_steps: params.relearningSteps }),
+      ...(params.weights !== undefined && params.weights.length > 0 && { w: params.weights }),
+    });
+    schedulers.set(key, scheduler);
   }
   return scheduler;
 }
@@ -74,6 +99,7 @@ export function toSchedulableCard(card: SchedulableCard): SchedulableCard {
     state: card.state,
     lastReview: card.lastReview,
     interval: card.interval,
+    learningStep: card.learningStep ?? 0,
   };
 }
 
@@ -82,10 +108,8 @@ function toFsrsCard(card: SchedulableCard): FsrsCard {
     due: card.due,
     stability: card.stability,
     difficulty: card.difficulty,
-    // ts-fsrs derives elapsed time from last_review and the review time itself
-    // (the scheduler's init, and get_retrievability), never from this field.
-    elapsed_days: 0,
     scheduled_days: card.interval,
+    learning_steps: card.learningStep ?? 0,
     reps: card.reps,
     lapses: card.lapses,
     state: card.state as State,
@@ -103,6 +127,7 @@ function fromFsrsCard(fsrsCard: FsrsCard): SchedulableCard {
     state: fsrsCard.state,
     lastReview: fsrsCard.last_review ?? null,
     interval: fsrsCard.scheduled_days,
+    learningStep: fsrsCard.learning_steps,
   };
 }
 
@@ -125,6 +150,16 @@ function sanitizeForReview(card: SchedulableCard): SchedulableCard {
       interval: 0,
     };
   }
+  // A New card has no memory yet; ts-fsrs 6 reads a leftover difficulty beside
+  // stability 0 as a corrupt state and throws, where 4 ignored it.
+  if (card.state === State.New && (card.stability !== 0 || card.difficulty !== 0)) {
+    return { ...card, stability: 0, difficulty: 0 };
+  }
+  // ts-fsrs 6 refuses a memory state below its floors (difficulty 1, stability
+  // S_MIN) where 4 computed with it; clamping keeps such a card's due date.
+  if (card.state !== State.New && (card.difficulty < 1 || card.stability < S_MIN)) {
+    return { ...card, difficulty: Math.max(card.difficulty, 1), stability: Math.max(card.stability, S_MIN) };
+  }
   return card;
 }
 
@@ -136,17 +171,21 @@ export function reviewCard(
   card: SchedulableCard,
   rating: Grade,
   now: Date = new Date(),
-  requestRetention?: number
+  params?: SchedulerParams
 ): ReviewResult {
-  const item = getScheduler(requestRetention).next(toFsrsCard(sanitizeForReview(card)), now, rating);
-  return { card: fromFsrsCard(item.card), elapsedDays: item.log.elapsed_days };
+  const safe = sanitizeForReview(card);
+  const item = getScheduler(params).next(toFsrsCard(safe), now, rating);
+  // ts-fsrs 6 no longer reports elapsed days; this is its old UTC calendar-day
+  // count, which calibration's `elapsedDays >= 1` filter relies on.
+  const elapsedDays = safe.state === State.New || safe.lastReview == null ? 0 : dateDiffInDays(safe.lastReview, now);
+  return { card: fromFsrsCard(item.card), elapsedDays };
 }
 
 /**
  * Probability of recalling the card at `now`, 0 for a card never reviewed. The
  * forgetting curve depends on stability alone, so no request retention here.
  */
-export function getRetrievability(card: SchedulableCard, now: Date = new Date()): number {
+export function getRetrievability(card: SchedulableCard, now: Date = new Date(), params?: SchedulerParams): number {
   if (card.state === State.New || card.lastReview == null) return 0;
-  return getScheduler().get_retrievability(toFsrsCard(card), now, false);
+  return getScheduler(params).retrievability(toFsrsCard(card), now);
 }

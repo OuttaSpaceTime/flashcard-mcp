@@ -122,6 +122,7 @@ export async function createCard(input: CreateCardInput): Promise<CreateCardResu
       state: parent.state,
       lastReview: parent.lastReview,
       interval: parent.interval,
+      learningStep: parent.learningStep,
     };
   }
 
@@ -160,6 +161,7 @@ export async function createCard(input: CreateCardInput): Promise<CreateCardResu
       state: schedule.state,
       lastReview: schedule.lastReview,
       interval: schedule.interval,
+      learningStep: schedule.learningStep ?? 0,
       suspended: input.inheritFrom == null && input.schedule?.suspended === true,
     },
   });

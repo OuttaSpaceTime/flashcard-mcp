@@ -119,8 +119,8 @@ describe("scheduler", () => {
         interval: 10,
       };
 
-      const strict = reviewCard(card, Rating.Good, now, 0.95);
-      const lax = reviewCard(card, Rating.Good, now, 0.8);
+      const strict = reviewCard(card, Rating.Good, now, { requestRetention: 0.95 });
+      const lax = reviewCard(card, Rating.Good, now, { requestRetention: 0.8 });
       expect(strict.card.interval).toBeLessThan(lax.card.interval);
       expect(strict.elapsedDays).toBe(10);
     });
@@ -160,7 +160,8 @@ describe("scheduler", () => {
 
       const r = getRetrievability(prismaCard);
       expect(r).toBeGreaterThan(0);
-      expect(r).toBeLessThan(0.5);
+      // FSRS-6's flatter forgetting curve leaves ~0.52 after a year at S=5.
+      expect(r).toBeLessThan(0.6);
     });
 
     it("returns 0 for a new card with no reviews", () => {
@@ -219,5 +220,54 @@ describe("cardMaturity", () => {
     for (const state of [State.New, State.Learning, State.Review, State.Relearning]) {
       expect(buckets).toContain(cardMaturity({ state, interval: 30 }));
     }
+  });
+
+  describe("Anki's learning steps", () => {
+    const minutes = (r: { card: { due: Date } }, now: Date) => Math.round((r.card.due.getTime() - now.getTime()) / 60000);
+    const now = new Date("2026-11-03T10:00:00Z");
+    const fresh = () => createNewFsrsCard(now);
+
+    it("shows 1m / 6m / 10m on a new card for steps 1m 10m", () => {
+      // Hard on the first step is the mean of the two steps (5.5m, shown 6m).
+      const a = [1, 2, 3].map((g) => minutes(reviewCard(fresh(), g as 1 | 2 | 3, now), now));
+      expect(a[0]).toBe(1);
+      expect(a[2]).toBe(10);
+      expect(a[1]).toBeGreaterThanOrEqual(5);
+      expect(a[1]).toBeLessThanOrEqual(6);
+    });
+
+    it("sends Again on the second step back to the first (1m), not 5m", () => {
+      const first = reviewCard(fresh(), Rating.Good, now).card;
+      expect(first.learningStep).toBe(1);
+      const later = new Date(now.getTime() + 10 * 60000);
+      expect(minutes(reviewCard(first, Rating.Again, later), later)).toBe(1);
+    });
+
+    it("uses the relearning step (10m) when a review card is failed", () => {
+      const review = { due: now, stability: 20, difficulty: 5, reps: 5, lapses: 0, state: State.Review as number, lastReview: new Date(now.getTime() - 20 * 86400000), interval: 20 };
+      expect(minutes(reviewCard(review, Rating.Again, now), now)).toBe(10);
+    });
+
+    it("reviews a New card that carries a leftover difficulty", () => {
+      const card = { ...fresh(), difficulty: 5 };
+      expect(minutes(reviewCard(card, Rating.Good, now), now)).toBe(10);
+    });
+
+    it("reviews a card whose stability is below the library's floor", () => {
+      const review = { due: now, stability: 0.0001, difficulty: 5, reps: 1, lapses: 0, state: State.Review as number, lastReview: now, interval: 0 };
+      expect(reviewCard(review, Rating.Good, now).card.stability).toBeGreaterThan(0);
+    });
+
+    it("follows steps passed in, as synced from Anki", () => {
+      const r = reviewCard(fresh(), Rating.Good, now, { learningSteps: ["2m", "30m"] });
+      expect(minutes(r, now)).toBe(30);
+    });
+
+    it("schedules differently with other FSRS weights", () => {
+      const review = { due: now, stability: 20, difficulty: 5, reps: 5, lapses: 0, state: State.Review as number, lastReview: new Date(now.getTime() - 20 * 86400000), interval: 20 };
+      const w = [0.2172, 1.1771, 3.2602, 16.1507, 7.0114, 0.57, 2.0966, 0.0069, 1.5261, 0.112, 1.0178, 1.849, 0.1133, 0.3127, 2.2934, 0.2191, 3.0004, 0.7536, 0.3332, 0.1437, 0.2];
+      const base = reviewCard(review, Rating.Good, now).card.interval;
+      expect(reviewCard(review, Rating.Good, now, { weights: w }).card.interval).not.toBe(base);
+    });
   });
 });

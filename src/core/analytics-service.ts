@@ -1,5 +1,6 @@
 import { getDb } from "../db/client.js";
 import { cardMaturity, getRetrievability, toSchedulableCard } from "./scheduler.js";
+import { currentSchedulerParams } from "./session-service.js";
 import { State } from "ts-fsrs";
 import { localDay, startOfLocalDay } from "./days.js";
 
@@ -47,6 +48,7 @@ export async function getRetentionByDeck(): Promise<
   }>
 > {
   const db = getDb();
+  const params = await currentSchedulerParams();
   const decks = await db.deck.findMany({
     include: {
       cards: {
@@ -69,7 +71,7 @@ export async function getRetentionByDeck(): Promise<
       let avgRetention = 0;
       if (reviewCards.length > 0) {
         const totalRetention = reviewCards.reduce((sum, card) => {
-          return sum + getRetrievability(toSchedulableCard(card));
+          return sum + getRetrievability(toSchedulableCard(card), undefined, params);
         }, 0);
         avgRetention = totalRetention / reviewCards.length;
       }

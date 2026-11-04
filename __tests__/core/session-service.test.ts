@@ -14,6 +14,7 @@ import {
 import { deleteCard } from "../../src/core/card-service.js";
 import { createDeck } from "../../src/core/deck-service.js";
 import { getDb } from "../../src/db/client.js";
+import { previewSchedules } from "../../src/core/session-service.js";
 import { Rating, State } from "ts-fsrs";
 
 let deckId: string;
@@ -932,5 +933,19 @@ describe("undoLastReview", () => {
     await startSession();
     expect(await undoLastReview(session.id)).toBeNull();
     expect(await getDb().review.count()).toBe(1);
+  });
+});
+
+describe("scheduling settings that can't be used", () => {
+  it("previews with the library's, never a throw", async () => {
+    await getDb().config.upsert({
+      where: { id: "default" },
+      create: { id: "default", learningSteps: "abc", relearningSteps: "30s", fsrsWeights: "[1,2,3]" },
+      update: { learningSteps: "abc", relearningSteps: "30s", fsrsWeights: "[1,2,3]" },
+    });
+    const card = { due: new Date(), stability: 0, difficulty: 0, reps: 0, lapses: 0, state: State.New as number, lastReview: null, interval: 0 };
+    const schedules = await previewSchedules(card);
+    expect(schedules[3].state).toBeDefined();
+    await getDb().config.delete({ where: { id: "default" } });
   });
 });

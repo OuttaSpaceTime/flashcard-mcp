@@ -6,11 +6,12 @@ import {
   toSchedulableCard,
   type ReviewResult,
   type SchedulableCard,
+  type SchedulerParams,
 } from "./scheduler.js";
 import { dueReviewWhere, NEW_CARD_WHERE } from "./pressure.js";
 import { MS_PER_DAY } from "./days.js";
 import type { MasterConfig, SessionQueueItem, SessionAdjustment } from "./types.js";
-import { Rating, State, type Grade } from "ts-fsrs";
+import { Rating, State, type Grade, type Steps } from "ts-fsrs";
 import type { Card as PrismaCard, Config, Prisma, StudySession } from "@prisma/client";
 
 interface SessionState {
@@ -75,6 +76,7 @@ interface ReviewUndo {
     | "state"
     | "lastReview"
     | "interval"
+    | "learningStep"
     | "leechFlaggedAt"
     | "leechDeferredLapses"
   >;
@@ -114,6 +116,48 @@ async function dropState(sessionId: string): Promise<void> {
   await getDb().studySession.updateMany({ where: { id: sessionId }, data: { queueState: null } });
 }
 
+/** The lengths ts-fsrs takes; any other throws. FSRS-4.5, 5 and 6. */
+const FSRS_WEIGHT_COUNTS = [17, 19, 21];
+
+/** Comma-separated steps, or undefined (the library's) when one isn't a step ts-fsrs reads. */
+function parseSteps(text: string): Steps | undefined {
+  const steps = text.split(",").map((x) => x.trim()).filter(Boolean);
+  return steps.every((s) => /^\d+(\.\d+)?[mhd]$/.test(s)) ? (steps as Steps) : undefined;
+}
+
+function parseWeights(text: string): number[] | undefined {
+  try {
+    const parsed: unknown = text === "" ? undefined : JSON.parse(text);
+    const usable =
+      Array.isArray(parsed) &&
+      FSRS_WEIGHT_COUNTS.includes(parsed.length) &&
+      parsed.every((x) => typeof x === "number" && Number.isFinite(x));
+    return usable ? (parsed as number[]) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The scheduler's inputs from the saved settings: retention, the steps and the
+ * FSRS weights anki-sync mirrored from the Anki deck options. Unreadable values
+ * (a hand-edited row, a sync from a newer Anki) fall back to the library's, never
+ * to a throw, as a preview runs for every card served.
+ */
+function schedulerParams(config: Config): SchedulerParams {
+  return {
+    requestRetention: config.requestRetention,
+    learningSteps: parseSteps(config.learningSteps),
+    relearningSteps: parseSteps(config.relearningSteps),
+    weights: parseWeights(config.fsrsWeights),
+  };
+}
+
+/** The scheduler's inputs right now, for whatever else computes with its memory model. */
+export async function currentSchedulerParams(): Promise<SchedulerParams> {
+  return schedulerParams(await readConfig());
+}
+
 /** The saved settings, created with the schema's defaults the first time. */
 async function readConfig(): Promise<Config> {
   const db = getDb();
@@ -145,6 +189,7 @@ export async function startSession(
   const scope = scopeWhere(filters);
 
   const saved = await readConfig();
+  const params = schedulerParams(saved);
   const config: MasterConfig = {
     maxNewCardsPerSession: overrides.maxNewCardsPerSession ?? saved.maxNewCardsPerSession,
     maxReviewCardsPerSession: overrides.maxReviewCardsPerSession ?? saved.maxReviewCardsPerSession,
@@ -159,7 +204,7 @@ export async function startSession(
   const rankedReviews = dueReviewCards
     .map((card) => ({
       card,
-      retrievability: getRetrievability(toSchedulableCard(card)),
+      retrievability: getRetrievability(toSchedulableCard(card), undefined, params),
     }))
     .sort((a, b) => a.retrievability - b.retrievability);
 
@@ -334,9 +379,9 @@ export async function previewSchedules(
   card: SchedulableCard,
   now: Date = new Date()
 ): Promise<Record<Grade, ReviewSchedule>> {
-  const { requestRetention } = await readConfig();
+  const params = schedulerParams(await readConfig());
   const schedulable = toSchedulableCard(card);
-  const at = (rating: Grade) => toReviewSchedule(reviewCard(schedulable, rating, now, requestRetention), now);
+  const at = (rating: Grade) => toReviewSchedule(reviewCard(schedulable, rating, now, params), now);
   return { 1: at(1), 2: at(2), 3: at(3), 4: at(4) };
 }
 
@@ -368,9 +413,9 @@ export async function submitReview(
   if (!card) throw new Error(`Card not found: ${cardId}`);
   if (!row) throw new Error(`Session ${sessionId} does not exist`);
 
-  const { requestRetention } = await readConfig();
+  const params = schedulerParams(await readConfig());
   const now = new Date();
-  const result = reviewCard(toSchedulableCard(card), rating, now, requestRetention);
+  const result = reviewCard(toSchedulableCard(card), rating, now, params);
   const schedule = toReviewSchedule(result, now);
 
   const isGood = rating === Rating.Good || rating === Rating.Easy;
@@ -398,6 +443,7 @@ export async function submitReview(
         state: result.card.state,
         lastReview: result.card.lastReview,
         interval: result.card.interval,
+        learningStep: result.card.learningStep ?? 0,
       },
     }),
     db.review.create({
@@ -436,6 +482,7 @@ export async function submitReview(
       state: card.state,
       lastReview: card.lastReview,
       interval: card.interval,
+      learningStep: card.learningStep,
       leechFlaggedAt: card.leechFlaggedAt,
       leechDeferredLapses: card.leechDeferredLapses,
     },

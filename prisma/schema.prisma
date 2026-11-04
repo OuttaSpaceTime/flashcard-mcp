@@ -35,6 +35,9 @@ model Card {
   state      Int       @default(0)
   lastReview DateTime?
   interval   Float     @default(0)
+  // Position in the (re)learning steps, ts-fsrs's learning_steps: Anki keeps
+  // the same counter, and without it every learning card would restart at step 1.
+  learningStep Int     @default(0)
   // Leech enforcement (see src/core/leeches.ts)
   // Stamped when the study loop serves this card at or over LEECH_LAPSES; a
   // stamp that is not covered by leechDeferredLapses blocks the next card.
@@ -106,6 +109,12 @@ model Config {
   maxReviewCardsPerSession Int     @default(15)
   requestRetention         Float   @default(0.9)
   practiceFirstMode        Boolean @default(true)
+  // Scheduling parameters mirrored from the Anki deck options by anki-sync, so the
+  // intervals shown here are the ones Anki shows. Steps are comma-separated
+  // ts-fsrs units; fsrsWeights is a JSON array, "" for the library's defaults.
+  learningSteps            String  @default("1m,10m")
+  relearningSteps          String  @default("10m")
+  fsrsWeights              String  @default("")
 }
 
 // Deletion has to be explicit state, not absence: several machines share one
