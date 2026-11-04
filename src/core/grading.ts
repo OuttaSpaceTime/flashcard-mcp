@@ -74,7 +74,14 @@ export const GRADE_SCHEMA = {
   type: "object",
   properties: {
     rating: { type: "integer", enum: [1, 2, 3, 4] },
-    reason: { type: "string" },
+    // Described here too: Haiku at low effort follows a field's own description
+    // more reliably than a paragraph of the system prompt (it kept opening with
+    // a recap of the right parts).
+    reason: {
+      type: "string",
+      description:
+        "Only what to improve: the missing, imprecise or wrong part, stated directly. Never mention what the answer got right, not even as a clause before a \"but\": start with the missing thing itself. For a complete, precise answer: \"Nothing to add.\"",
+    },
   },
   required: ["rating", "reason"],
   additionalProperties: false,
@@ -92,7 +99,7 @@ Rate the unaided answer against the back, with this fixed rubric:
 
 Judge substance, not wording. A terse answer that names the right idea is Good. Do not reward padding, and do not penalise typos or informal phrasing. When the developer says they don't know, rate Again.
 
-The reason is one or two plain sentences addressed to the developer as "you". Say what was right and, on a weak answer, name the missing piece plainly: seeing the gap at once is the point. Do not ask a question back, and do not add a lecture.`;
+The reason is only what the developer can improve, in one or two plain sentences addressed to "you". The developer already knows what they got right and reads the reason to see the gap at once, so never recap, praise or confirm anything correct: do not write "you name", "you describe", "you correctly", "you identified", "you got" or "good start", and never the shape "You did X but miss Y": drop the X clause and say only Y. Begin with the gap itself, e.g. "You leave out that ...", "That is imprecise: ...", "Wrong: ...". The first clause of the reason must already be the missing or wrong thing. When the answer is complete and precise, the whole reason is "Nothing to add." Do not ask a question back, and do not add a lecture.`;
 
 export function buildGradePrompt(input: GradeInput): string {
   return [
