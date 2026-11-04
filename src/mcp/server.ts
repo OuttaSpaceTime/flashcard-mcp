@@ -9,8 +9,11 @@ import { listDeckStats, getDeckStats, deleteDeck } from "../core/deck-service.js
 import { cardMaturity } from "../core/scheduler.js";
 import {
   createCard,
+  createCodeCard,
   getCard,
+  getCodeCardExercise,
   updateCard,
+  updateCodeCard,
   deleteCard,
   deleteCards,
   searchCards,
@@ -40,6 +43,37 @@ import { checkCalibration } from "../core/calibration.js";
 import { deferLeech, leechPayload } from "../core/leeches.js";
 import { listCardNotes, resolveCardNote } from "../core/card-notes.js";
 import { PACKAGE_VERSION } from "../core/version.js";
+import {
+  EXERCISE_KINDS,
+  checkExercise,
+  exerciseView,
+  parseExercise,
+  revealExercise,
+  runExercise,
+} from "../core/exercises.js";
+
+/** A code card's exercise (src/core/exercises.ts). */
+const EXERCISE_SCHEMA = z.object({
+  kind: z
+    .enum(EXERCISE_KINDS)
+    .describe(
+      "predict: read the code and type what each case's expr evaluates to (Anki: cloze). fill: complete the blanks in the source so each expr equals its goal (Anki: cloze). compose: the same with bigger pieces put together (Anki: front and back)."
+    ),
+  lang: z.literal("ruby"),
+  brief: z.string().describe("What to solve, one or two sentences of simple HTML. Must not give the answer away."),
+  source: z
+    .string()
+    .describe(
+      "The code. fill and compose mark each blank {{c1::its solution}}, always c1; predict has no blanks. A multi-line blank is a block to write."
+    ),
+  cases: z
+    .array(z.object({ expr: z.string(), goal: z.string() }))
+    .min(1)
+    .describe(
+      "Each is evaluated after the source: expr must equal goal, compared as values, so write goal as an expression (\"[1, 2]\", \"nil\"). A predict card asks for each goal."
+    ),
+  explain: z.string().describe("The one-clause why, shown once it is over. Simple HTML, same limits as a card's back."),
+});
 
 /** Build a standard text result containing JSON-serialized data. */
 function j(data: unknown) {
@@ -92,13 +126,14 @@ export function createServer(): McpServer {
     "get_next_card",
     {
       description:
-        "Get the next card in the current study session. Includes `position` (1-based) and `total` (current session size) for a `Card position/total` line; `total` grows by one whenever submit_review returns intraDay: true, since that card is re-queued at the end. `repeat: true` marks a re-served intra-day learning repeat. A served card that has lapsed 5+ times comes back with a `leech` field ({lapses, mustResolve: true}) and stops the loop: the next call to this tool errors until that card is rewritten (update_card), split (create_card with inheritFrom, then delete_card), deleted, or kept as-is via resolve_leech.",
+        "Get the next card in the current study session. Includes `position` (1-based) and `total` (current session size) for a `Card position/total` line; `total` grows by one whenever submit_review returns intraDay: true, since that card is re-queued at the end. `repeat: true` marks a re-served intra-day learning repeat. A code card also carries `exercise`: what to show, with no answers in it; its answers are checked with run_code_card. A served card that has lapsed 5+ times comes back with a `leech` field ({lapses, mustResolve: true}) and stops the loop: the next call to this tool errors until that card is rewritten (update_card), split (create_card with inheritFrom, then delete_card), deleted, or kept as-is via resolve_leech.",
       inputSchema: { sessionId: z.string() },
     },
     async (args) => {
       const card = await getNextCard(args.sessionId);
       if (card == null) return j({ done: true, message: "No more cards in queue" });
       const leech = leechPayload(card);
+      const exercise = parseExercise(card.exercise);
       const queuePosition = await getQueuePosition(args.sessionId);
       return j({
         ...(queuePosition ?? {}),
@@ -111,6 +146,7 @@ export function createServer(): McpServer {
         category: card.category,
         reps: card.reps,
         lapses: card.lapses,
+        ...(exercise == null ? {} : { exercise: exerciseView(exercise) }),
         ...(leech ? { leech } : {}),
       });
     }
@@ -254,7 +290,7 @@ export function createServer(): McpServer {
         front: z
           .string()
           .describe(
-            "Question side, as simple HTML: <b>, <i>, <code>, <pre>, <ul>/<ol>/<li>, <br>. Must ask one question. Rejected: Markdown (backticks, **bold**, list lines), [[wikilinks]], em dashes, and newlines outside <pre>."
+            "Question side, as simple HTML: <b>, <i>, <code>, <pre>, <ul>/<ol>/<li>, <br>. Must ask one question. Rejected: Markdown (backticks, **bold**, list lines), [[wikilinks]], em dashes, newlines outside <pre>, and cloze deletions, which only code cards have (create_code_card)."
           ),
         back: z
           .string()
@@ -302,6 +338,78 @@ export function createServer(): McpServer {
   );
 
   server.registerTool(
+    "check_code_card",
+    {
+      description:
+        "Dry-run a code card's exercise without saving anything, the same checks create_code_card makes: `ok`, the `problems` that would refuse it (a solution that doesn't pass, a card that passes with its blanks nil, two runs that differ, a badly formed brief), `solution` with what every case really evaluates to and what the code prints, and the `sides` it would be saved with. Use it while drafting, and read the real values rather than trusting a hand-written goal.",
+      inputSchema: { exercise: EXERCISE_SCHEMA },
+    },
+    async (args) => j(await checkExercise(args.exercise))
+  );
+
+  server.registerTool(
+    "run_code_card",
+    {
+      description:
+        "Check answers to a saved code card by really running them: one answer per blank, or per case on a predict card. Returns `status` (pass, wrong, error, timeout, incomplete, unavailable), each case's value, what was printed, and on a pass `rating` (3, Good) and `explain`. Wrong tries and errors cost nothing and can be repeated. Nothing is written: submit_review does that, with the rating given. A predict card's real values stay hidden until it passes.",
+      inputSchema: { cardId: z.string(), answers: z.array(z.string()) },
+    },
+    async (args) => j(await runExercise(await getCodeCardExercise(args.cardId), args.answers))
+  );
+
+  server.registerTool(
+    "reveal_code_card",
+    {
+      description:
+        "Give up on a saved code card: its solution, run, with `explain` and `rating` (1, Again). Nothing is written: submit_review does that. Only once the developer has tried and asks for it.",
+      inputSchema: { cardId: z.string() },
+    },
+    async (args) => j(await revealExercise(await getCodeCardExercise(args.cardId)))
+  );
+
+  server.registerTool(
+    "create_code_card",
+    {
+      description:
+        "Create a card answered by running code (Omvida runs it in a sandbox and compares values). The card's front and back are written from the exercise. Refused unless its own solution passes for real and, for fill and compose, its blanks left as nil fail, so a goal can't be wrong. Prefer this over a plain card when what's being learned is how code behaves. Same pressure gate and inheritFrom as create_card.",
+      inputSchema: {
+        deckId: z.string(),
+        exercise: EXERCISE_SCHEMA,
+        tags: z.array(z.string()).optional(),
+        category: z.string().optional().describe("Card category"),
+        inheritFrom: z.string().optional().describe("Source card id to inherit the FSRS schedule from, as in create_card"),
+      },
+    },
+    async (args) => {
+      const result = await createCodeCard({
+        deckId: args.deckId,
+        exercise: args.exercise,
+        tags: args.tags,
+        category: args.category,
+        inheritFrom: args.inheritFrom,
+        checkDuplicates: true,
+      });
+      return j({
+        card: { id: result.card.id, front: result.card.front, back: result.card.back, due: result.card.due },
+        duplicateWarning: result.duplicateWarning,
+      });
+    }
+  );
+
+  server.registerTool(
+    "update_code_card",
+    {
+      description:
+        "Replace a code card's exercise, with the same checks as create_code_card. update_card still changes its tags and category, but not its front or back. Its kind of Anki note can't change: a plain card can't become a code card or the reverse, nor a compose card a cloze. For that, create a new card with inheritFrom and delete this one.",
+      inputSchema: { cardId: z.string(), exercise: EXERCISE_SCHEMA },
+    },
+    async (args) => {
+      const updated = await updateCodeCard(args.cardId, args.exercise);
+      return j({ id: updated.id, front: updated.front, back: updated.back, tags: updated.tags });
+    }
+  );
+
+  server.registerTool(
     "get_card",
     {
       description:
@@ -316,6 +424,7 @@ export function createServer(): McpServer {
         deckId: card.deckId,
         front: card.front,
         back: card.back,
+        exercise: parseExercise(card.exercise),
         tags: card.tags,
         category: card.category,
         type: card.type,

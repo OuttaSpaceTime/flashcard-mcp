@@ -12,6 +12,7 @@
 import { getDb } from "../db/client.js";
 import { importCards, type ImportItem, type ImportOptions, type ImportResult } from "./card-import.js";
 import { parseTags } from "./types.js";
+import { clozeSides } from "./cloze.js";
 
 export interface AnkiNote {
   front: string;
@@ -285,8 +286,8 @@ export async function exportCardsToAnkiTxt(
 
   const content = exportToAnkiTxt(
     cards.map((c) => ({
-      front: c.front,
-      back: c.back,
+      // Text has no cloze note type, so a code card's goes as hidden and shown.
+      ...clozeSides(c.front, c.back),
       tags: parseTags(c.tags),
       guid: c.id,
       deck: c.deck.name,

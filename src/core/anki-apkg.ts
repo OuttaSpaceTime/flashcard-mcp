@@ -21,6 +21,7 @@ import {
 } from "./card-import.js";
 import type { CarriedSchedule } from "./card-service.js";
 import { parseTags } from "./types.js";
+import { clozeSides } from "./cloze.js";
 
 // --- Types ---
 
@@ -407,8 +408,8 @@ export async function exportCardsToApkg(
       deckName: deck.name,
       cards: deck.cards.map((c) => ({
         id: c.id,
-        front: c.front,
-        back: c.back,
+        // The exported note is Basic, so a code card's cloze goes as hidden and shown.
+        ...clozeSides(c.front, c.back),
         tags: parseTags(c.tags),
         schedule: c,
         reviews: c.reviews.map((r) => ({

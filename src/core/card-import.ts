@@ -57,6 +57,7 @@ interface ExistingCard {
   id: string;
   front: string;
   lastReview: Date | null;
+  exercise: string | null;
 }
 
 interface DeckPlan {
@@ -87,7 +88,7 @@ async function planDeck(
       ? []
       : await getDb().card.findMany({
           where: { deckId: deck.id },
-          select: { id: true, front: true, lastReview: true },
+          select: { id: true, front: true, lastReview: true, exercise: true },
         });
   const byFront = new Map(existing.map((c) => [c.front, c]));
 
@@ -106,7 +107,9 @@ async function planDeck(
     seen.add(item.front);
 
     const card = byFront.get(item.front);
-    if (card != null && conflict === "ours") {
+    // A code card's sides are written from its exercise, which no file carries, so
+    // it is never overwritten: updateCard would refuse it mid-import.
+    if (card != null && (conflict === "ours" || card.exercise != null)) {
       result.duplicates++;
     } else if (card != null) {
       // The front stays as it is, so only the back is held to the rules.

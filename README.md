@@ -4,12 +4,13 @@ A spaced-repetition flashcard system with an MCP server and CLI, built on TypeSc
 
 ## Features
 
-- **FSRS scheduling** — state-of-the-art spaced repetition via `ts-fsrs`
-- **MCP server** — 27 tools for sessions, cards, decks, stats, pressure, calibration, leech enforcement, card notes, and duplicate detection over stdio
+- **FSRS scheduling** — state-of-the-art spaced repetition via `ts-fsrs` (FSRS-6, with Anki's learning steps and weights mirrored by anki-sync)
+- **MCP server** — 32 tools for sessions, cards, code cards, decks, stats, pressure, calibration, leech enforcement, card notes, and duplicate detection over stdio
 - **CLI** — `init`, `decks`, `cards`, `categories`, `study`, `stats`, `calibration`, `overview`, `maturity`, `import`, `export`, `embeddings`, `db:dump`, `db:restore`, `db:sync`
 - **Semantic duplicate detection** — two-stage Jaccard + cosine similarity on 384-dim embeddings
 - **Anki interop** — import/export `.apkg` (including zstd-compressed `collection.anki21b`) with full scheduling, plus plain-text `.txt`
 - **Categories** — tag cards with a free-form category and filter sessions/lists accordingly
+- **Code cards** — a card answered by running it, after Execute Program: a real Ruby compares values, under bubblewrap, so both need to be installed for them to run (`create_code_card`, `check_code_card`, `run_code_card`)
 - **Anti-overload** — caps new cards at 5 and reviews at 15 per session (the `Config` row's defaults); card creation requires explicit approval
 
 ## Setup

@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { State } from "ts-fsrs";
-import { createHandlers } from "../../src/app/handlers.js";
+import { createHandlers, toAppCard } from "../../src/app/handlers.js";
 import { dispatch } from "../../src/app/server.js";
 import { bucketWeek } from "../../src/core/overview.js";
 import { localDay } from "../../src/core/days.js";
-import { updateCard } from "../../src/core/card-service.js";
+import { createCard, createCodeCard, updateCard, updateCodeCard } from "../../src/core/card-service.js";
 import { createDeck } from "../../src/core/deck-service.js";
 import { getDb } from "../../src/db/client.js";
 import type Anthropic from "@anthropic-ai/sdk";
@@ -367,5 +367,114 @@ describe("dispatch", () => {
 
   it("ignores blank lines", async () => {
     expect(await dispatch(handlers, "   ")).toBeNull();
+  });
+});
+
+describe("code cards", () => {
+  const h = createHandlers({ gradeCall: fakeGrade });
+  const call = (method: string, params: Record<string, unknown> = {}): Promise<unknown> => h[method](params);
+
+  beforeEach(async () => {
+    deckId = (await createDeck("Web")).id;
+  });
+
+  const exercise = {
+    kind: "fill" as const,
+    lang: "ruby" as const,
+    brief: "Double it.",
+    source: "def double(n) = n * {{c1::2}}",
+    cases: [{ expr: "double(2)", goal: "4" }],
+    explain: "Multiplying doubles.",
+  };
+
+  async function codeCard(): Promise<string> {
+    const { card } = await createCodeCard({ deckId, exercise });
+    return card.id;
+  }
+
+  it("a card reaches the app with what to draw, and not the answer", async () => {
+    const cardId = await codeCard();
+    const session = (await call("startSession")) as { sessionId: string };
+    const next = (await call("nextCard", { sessionId: session.sessionId })) as {
+      card: { id: string; front: string; exercise: { kind: string; parts: unknown[]; answers: number } };
+    };
+    expect(next.card.id).toBe(cardId);
+    expect(next.card.exercise.kind).toBe("fill");
+    expect(next.card.exercise.answers).toBe(1);
+    expect(JSON.stringify(next.card.exercise)).not.toContain("{{c1::");
+    expect(next.card.front).toContain("[...]");
+    expect(next.card.front).not.toContain("{{c1::");
+  });
+
+  it("an ordinary card has no exercise", async () => {
+    await seed(1);
+    const session = (await call("startSession")) as { sessionId: string };
+    const next = (await call("nextCard", { sessionId: session.sessionId })) as { card: { exercise: unknown } };
+    expect(next.card.exercise).toBeNull();
+  });
+
+  it("a code card's blanks are hidden on the front and shown on the back", async () => {
+    await codeCard();
+    const card = await getDb().card.findFirstOrThrow({ where: { exercise: { not: null } } });
+    expect(toAppCard(card, "Deck").front).toContain("n * [...]");
+    expect(toAppCard(card, "Deck").back).toContain("n * <b>2</b>");
+  });
+
+  it("clozes are refused on every other way a card is written", async () => {
+    await expect(createCard({ deckId, front: "An origin is {{c1::this}}.", back: "B" })).rejects.toThrow(/only a code card/);
+    await expect(createCard({ deckId, front: "<pre><code>{{c1::x}}</code></pre>", back: "B" })).rejects.toThrow(/only a code card/);
+    await expect(createCard({ deckId, front: "Q?", back: "{{c1::A}}" })).rejects.toThrow(/only a code card/);
+    const plain = (await seed(1))[0];
+    await expect(updateCard(plain.id, { front: "Now {{c1::a cloze}}." })).rejects.toThrow(/only a code card/);
+    await expect(updateCard(plain.id, { back: "{{c1::x}}" })).rejects.toThrow(/only a code card/);
+    expect(await getDb().card.count({ where: { exercise: null, front: { contains: "{{c1::" } } })).toBe(0);
+  });
+
+  it("runExercise answers with the verdict and the rating", async () => {
+    const cardId = await codeCard();
+    const right = (await call("runExercise", { cardId, answers: ["2"] })) as { status: string; rating: number };
+    expect(right.status).toBe("pass");
+    expect(right.rating).toBe(3);
+    const wrong = (await call("runExercise", { cardId, answers: ["3"] })) as { status: string; rating: unknown };
+    expect(wrong.status).toBe("wrong");
+    expect(wrong.rating).toBeNull();
+  });
+
+  it("a newer runExercise stops the one before it", async () => {
+    const cardId = await codeCard();
+    const stuck = call("runExercise", { cardId, answers: ["loop {}"] }) as Promise<{ status: string; durationMs: number }>;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const latest = (await call("runExercise", { cardId, answers: ["2"] })) as { status: string };
+    expect(latest.status).toBe("pass");
+    const first = await stuck;
+    expect(first.status).toBe("timeout");
+    expect(first.durationMs).toBeLessThan(2000);
+  });
+
+  it("revealExercise gives the solution and rates Again", async () => {
+    const cardId = await codeCard();
+    const res = (await call("revealExercise", { cardId })) as { answers: string[]; rating: number };
+    expect(res.answers).toEqual(["2"]);
+    expect(res.rating).toBe(1);
+  });
+
+  it("refuses them on an ordinary card", async () => {
+    const card = (await seed(1))[0];
+    await expect(call("runExercise", { cardId: card.id, answers: [] })).rejects.toThrow(/Not a code card/);
+  });
+
+  it("a code card's sides are written only from its exercise", async () => {
+    const cardId = await codeCard();
+    await expect(updateCard(cardId, { back: "something else" })).rejects.toThrow(/update_code_card/);
+    await expect(updateCard(cardId, { tags: "ruby" })).resolves.toBeDefined();
+    const changed = await updateCodeCard(cardId, { ...exercise, explain: "Better." });
+    expect(changed.back).toBe("Better.");
+  });
+
+  it("a card can't change between the kinds of Anki note it would need", async () => {
+    const plain = (await seed(1))[0];
+    await expect(updateCodeCard(plain.id, exercise)).rejects.toThrow(/inheritFrom/);
+    const cardId = await codeCard();
+    await expect(updateCodeCard(cardId, { ...exercise, kind: "compose" })).rejects.toThrow(/inheritFrom/);
   });
 });

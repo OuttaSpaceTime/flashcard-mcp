@@ -11,7 +11,7 @@ import {
   endSession,
 } from "../core/session-service.js";
 import { checkPressure } from "../core/pressure.js";
-import { allCards, deleteCard, getCard, searchCards } from "../core/card-service.js";
+import { allCards, deleteCard, getCard, getCodeCardExercise, searchCards } from "../core/card-service.js";
 import { deckNames } from "../core/deck-service.js";
 import { recentlyStudied } from "../core/analytics-service.js";
 import { changeTokens } from "../core/change-tokens.js";
@@ -22,6 +22,8 @@ import { getOverview } from "../core/overview.js";
 import { recentSessions } from "../core/recent-sessions.js";
 import { listCardNotes, setCardNote } from "../core/card-notes.js";
 import { localDay } from "../core/days.js";
+import { clozeSides } from "../core/cloze.js";
+import { exerciseView, parseExercise, revealExercise, runExercise, type ExerciseView } from "../core/exercises.js";
 
 /**
  * What the Omvida app can ask of the deck: the /study loop's MCP tools, reshaped
@@ -68,20 +70,25 @@ export interface AppCard {
   /** Local calendar day the card is due. */
   dueDay: string;
   suspended: boolean;
+  /** How a code card is drawn, or null on any other card. */
+  exercise: ExerciseView | null;
 }
 
+// The sides as they read. A code card's blanks are hidden on the front and shown
+// on the back, so the app's every view of a card needs no idea of clozes.
 export function toAppCard(card: PrismaCard, deck: string): AppCard {
+  const exercise = parseExercise(card.exercise);
   return {
     id: card.id,
     deck,
-    front: card.front,
-    back: card.back,
+    ...(exercise == null ? { front: card.front, back: card.back } : clozeSides(card.front, card.back)),
     tags: parseTags(card.tags),
     state: CARD_STATE_NAMES[card.state] ?? "new",
     reps: card.reps,
     lapses: card.lapses,
     dueDay: localDay(card.due),
     suspended: card.suspended,
+    exercise: exercise == null ? null : exerciseView(exercise),
   };
 }
 
@@ -107,6 +114,7 @@ export type Handler = (params: Record<string, unknown>) => Promise<unknown>;
 
 export function createHandlers(deps: { gradeCall?: GradeCall } = {}): Record<string, Handler> {
   const grader = new Grader(deps.gradeCall);
+  let latestRun: AbortController | null = null;
   return {
     overview: async (p) => getOverview({ pendingLimit: optNum(p, "pendingLimit") }),
 
@@ -172,6 +180,22 @@ export function createHandlers(deps: { gradeCall?: GradeCall } = {}): Record<str
     // The session's newest review taken back, or null with none left. `nextCard`
     // then serves its card again. Redo is `review` with the same rating.
     undoReview: async (p) => undoLastReview(str(p, "sessionId")),
+
+    // A code card's try: its result, and on a pass the rating to write. The app
+    // shows the verdict and runs this on every pause in the typing as well, so a
+    // newer run stops the last one: an endless loop being typed would otherwise
+    // keep a spinning process per pause, each until the timeout. The app sends a
+    // run only after dropping interest in the one before.
+    runExercise: async (p) => {
+      latestRun?.abort();
+      const run = new AbortController();
+      latestRun = run;
+      const answers = Array.isArray(p.answers) ? p.answers.map(String) : [];
+      return runExercise(await getCodeCardExercise(str(p, "cardId")), answers, run.signal);
+    },
+
+    // Giving up on a code card: the solution, run, and the rating that writes.
+    revealExercise: async (p) => revealExercise(await getCodeCardExercise(str(p, "cardId"))),
 
     skip: async (p) => ({ skipped: await skipCard(str(p, "sessionId")) }),
 

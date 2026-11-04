@@ -15,6 +15,8 @@ import {
   type SimilarCard,
 } from "./embeddings.js";
 import { CARD_STATE_NAMES, parseTags, serializeTags, type CardStateName, type CardType } from "./types.js";
+import { hasCloze } from "./cloze.js";
+import { assertExerciseWorks, exerciseSides, parseExercise, type Exercise } from "./exercises.js";
 import type { Card as PrismaCard, Prisma } from "@prisma/client";
 import type { State } from "ts-fsrs";
 
@@ -47,6 +49,8 @@ interface CreateCardInput {
    * so an import is refused atomically instead of aborting half-applied.
    */
   skipPressureGate?: boolean;
+  /** Set only by createCodeCard, which wrote and checked the two sides itself. */
+  exercise?: Exercise;
 }
 
 interface CreateCardResult {
@@ -90,7 +94,9 @@ function scheduleEmbeddingUpdate(cardId: string, front: string, back: string): v
 }
 
 export async function createCard(input: CreateCardInput): Promise<CreateCardResult> {
-  assertCardContent({ front: input.front, back: input.back });
+  // A code card's back holds its solution, which the answer's limits are not
+  // about: createCodeCard held the brief and the explanation to them instead.
+  if (input.exercise == null) assertCardContent({ front: input.front, back: input.back });
   const db = getDb();
 
   // Splits/derives (inheritFrom) are exempt: they inherit an existing schedule,
@@ -153,6 +159,7 @@ export async function createCard(input: CreateCardInput): Promise<CreateCardResu
       type: input.type ?? "guided",
       category: input.category ?? null,
       inheritedFrom: input.inheritFrom ?? null,
+      exercise: input.exercise == null ? null : JSON.stringify(input.exercise),
       due: schedule.due,
       stability: schedule.stability,
       difficulty: schedule.difficulty,
@@ -169,6 +176,52 @@ export async function createCard(input: CreateCardInput): Promise<CreateCardResu
   scheduleEmbeddingUpdate(card.id, card.front, card.back);
 
   return { card, duplicateWarning };
+}
+
+/** A code card's exercise, or an error naming what the id is instead. */
+export async function getCodeCardExercise(cardId: string): Promise<Exercise> {
+  const card = await getCard(cardId);
+  if (card == null) throw new Error(`Card not found: ${cardId}`);
+  const exercise = parseExercise(card.exercise);
+  if (exercise == null) throw new Error(`Not a code card: ${cardId}`);
+  return exercise;
+}
+
+/** A card answered by running it (exercises.ts): its sides come from the exercise. */
+export async function createCodeCard(
+  input: Omit<CreateCardInput, "front" | "back" | "exercise"> & { exercise: Exercise }
+): Promise<CreateCardResult> {
+  await assertExerciseWorks(input.exercise);
+  return createCard({ ...input, ...exerciseSides(input.exercise) });
+}
+
+export async function updateCodeCard(id: string, exercise: Exercise): Promise<PrismaCard> {
+  await assertExerciseWorks(exercise);
+  const db = getDb();
+  const card = await db.card.findUnique({ where: { id } });
+  if (card == null) throw new Error(`Card not found: ${id}`);
+  const sides = exerciseSides(exercise);
+  assertSameAnkiShape(card, sides.front);
+  const updated = await db.card.update({
+    where: { id },
+    data: { ...sides, exercise: JSON.stringify(exercise), ...(await leechResolutionFor(id)) },
+  });
+  scheduleEmbeddingUpdate(id, updated.front, updated.back);
+  return updated;
+}
+
+/**
+ * An Anki note keeps its note type, so a card keeps its shape: changing one on
+ * Anki's side needs a schema change, which forces a full upload from one machine
+ * over every other's. A card that has to change shape is a new card
+ * (inheritFrom keeps its schedule), and the old one deleted.
+ */
+function assertSameAnkiShape(card: PrismaCard, front: string): void {
+  if (card.exercise != null && hasCloze(card.front) === hasCloze(front)) return;
+  throw new Error(
+    "This edit would change the card's kind (plain, cloze code or compose code), which its Anki note cannot follow. " +
+      "Create a new card with inheritFrom and delete this one."
+  );
 }
 
 export async function backfillEmbeddings(
@@ -246,6 +299,12 @@ export async function updateCard(
 ): Promise<PrismaCard> {
   assertCardContent({ front: updates.front, back: updates.back });
   const db = getDb();
+  if (updates.front !== undefined || updates.back !== undefined) {
+    const card = await db.card.findUnique({ where: { id } });
+    if (card?.exercise != null) {
+      throw new Error("A code card's front and back are written from its exercise: use update_code_card.");
+    }
+  }
   const { schedule, ...fields } = updates;
   const updated = await db.card.update({
     where: { id },

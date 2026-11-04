@@ -72,9 +72,9 @@ afterEach(async () => {
 });
 
 describe("MCP server", () => {
-  it("registers 27 tools", async () => {
+  it("registers 32 tools", async () => {
     const { tools } = await client.listTools();
-    expect(tools).toHaveLength(27);
+    expect(tools).toHaveLength(32);
   });
 
   it("get_next_card spreads the queue position and a leech field, then blocks", async () => {

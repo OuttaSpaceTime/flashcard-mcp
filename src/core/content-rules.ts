@@ -1,3 +1,5 @@
+import { CLOZE_MARKUP } from "./cloze.js";
+
 /**
  * Card content rules: fields are simple HTML, the only format Anki renders
  * reliably (<b>, <i>, <code>, <pre>, <ul>/<ol>/<li>, <br>).
@@ -53,6 +55,13 @@ const RULES: Rule[] = [
 /** Returns human-readable violations; empty array = content is clean. */
 export function validateCardContent(text: string): string[] {
   const violations: string[] = [];
+  // Inside <pre> as well, where the other rules don't look: Anki finds a cloze
+  // anywhere in a field. Only a code card has them, and it writes its own sides
+  // (exercises.ts), past this check. A plain cloze hands over the sentence frame
+  // and tests recognition rather than retrieval.
+  if (CLOZE_MARKUP.test(text)) {
+    violations.push("cloze deletions are not allowed: only a code card has them (create_code_card). Ask a question instead");
+  }
   // newlines are only legitimate inside <pre> blocks
   const outsidePre = text.replace(/<pre>[\s\S]*?<\/pre>/gi, "");
   if (outsidePre.includes("\n")) {

@@ -10,9 +10,19 @@ import { createDeck } from "../../src/core/deck-service.js";
 import { createCard } from "../../src/core/card-service.js";
 import { PAUSE_FLASHCARDS, PAUSE_NEW_TODAY } from "../../src/core/pressure.js";
 import { getDb } from "../../src/db/client.js";
+import type { Exercise } from "../../src/core/exercises.js";
 import { State } from "ts-fsrs";
 
 let deckId: string;
+
+const CODE_EXERCISE: Exercise = {
+  kind: "fill",
+  lang: "ruby",
+  brief: "Transform it.",
+  source: "[1].{{c1::map}}",
+  cases: [{ expr: "1", goal: "1" }],
+  explain: "why",
+};
 
 describe("anki-io", () => {
   beforeEach(async () => {
@@ -140,6 +150,22 @@ describe("anki-io", () => {
   // --- Export ---
 
   describe("exportCardsToAnkiTxt", () => {
+    it("exports a code card's cloze as hidden and shown, not as its answer on the front", async () => {
+      await createCard({ deckId, front: "<pre><code>[1].{{c1::map}}</code></pre>", back: "why", exercise: CODE_EXERCISE });
+      const { content } = await exportCardsToAnkiTxt();
+      expect(content).not.toContain("{{c1::");
+      expect(content).toContain("[1].[...]");
+      expect(content).toContain("<b>map</b>");
+    });
+
+    it("an import never overwrites a code card, whose sides its exercise writes", async () => {
+      const front = "<pre><code>[1].{{c1::map}}</code></pre>";
+      const { card } = await createCard({ deckId, front, back: "why", exercise: CODE_EXERCISE });
+      const result = await importTxtNotes([{ front, back: "theirs", tags: [] }], { deck: "React", conflict: "theirs" });
+      expect(result.duplicates).toBe(1);
+      expect((await getDb().card.findUnique({ where: { id: card.id } }))?.back).toBe("why");
+    });
+
     it("exports cards as tab-separated text with headers", async () => {
       await createCard({ deckId, front: "What is JSX?", back: "A syntax extension", tags: ["react"] });
       await createCard({ deckId, front: "What is a hook?", back: "A function", tags: ["react", "hooks"] });
@@ -380,5 +406,16 @@ describe("anki-io", () => {
       const result = await importTxtNotes(parseAnkiTxt("today 0\tb"), { deck: "React", conflict: "theirs" });
       expect(result.updated).toBe(1);
     });
+  });
+});
+
+describe("clozes from a file", () => {
+  it("a cloze in an import is refused as invalid, not created", async () => {
+    await createDeck("Imported");
+    const notes = parseAnkiTxt("An origin is {{c1::this}}.\tBack\nA plain question?\tBack");
+    const result = await importTxtNotes(notes, { deck: "Imported" });
+    expect(result.invalid).toBe(1);
+    expect(result.created).toBe(1);
+    expect(await getDb().card.count({ where: { front: { contains: "{{c1::" } } })).toBe(0);
   });
 });

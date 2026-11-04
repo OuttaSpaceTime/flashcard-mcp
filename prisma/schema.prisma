@@ -26,6 +26,10 @@ model Card {
   // Parent card id when this row was created via createCard's inheritFrom
   // (a split/derive). Marks it as deck maintenance, not new intake.
   inheritedFrom String?
+  // A code card's exercise as JSON (src/core/exercises.ts), null on any other
+  // card. front and back are written from it, so every other reader of a card
+  // works on one unchanged.
+  exercise   String?
   // FSRS scheduling
   due        DateTime  @default(now())
   stability  Float     @default(0)
